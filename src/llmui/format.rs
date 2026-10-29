@@ -73,6 +73,7 @@ pub fn media_marker(media: &Media) -> String {
                 }
             }
         }
+        _ => "[media]".to_string(),
     }
 }
 
@@ -129,22 +130,21 @@ pub async fn format_history_message(
     ));
     // Sender: own messages show as the character itself; forwards show origin + sharer.
     if let Some(forward_header) = message.forward_header() {
-        if let tl::enums::MessageFwdHeader::Header(header) = forward_header {
-            if let Some(from_id) = header.from_id {
-                let id = peer_ref_id(&from_id);
-                if let Ok(id) = id {
-                    line.push_str(&format!(
-                        " sender={} forwarded_by={}",
-                        xml_attr(entity_name(tg, id).await),
-                        xml_attr(
-                            if sender_id == my_id {
-                                character_name.to_string()
-                            } else {
-                                entity_name(tg, sender_id).await
-                            }
-                        )
-                    ));
-                }
+        let tl::enums::MessageFwdHeader::Header(header) = forward_header;
+        if let Some(from_id) = header.from_id {
+            let id = peer_ref_id(&from_id);
+            if let Ok(id) = id {
+                line.push_str(&format!(
+                    " sender={} forwarded_by={}",
+                    xml_attr(entity_name(tg, id).await),
+                    xml_attr(
+                        if sender_id == my_id {
+                            character_name.to_string()
+                        } else {
+                            entity_name(tg, sender_id).await
+                        }
+                    )
+                ));
             }
         }
     } else if sender_id == my_id {
