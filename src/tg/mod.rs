@@ -136,7 +136,7 @@ impl Tg {
     pub async fn peer_ref(&self, dialog_id: i64) -> TgResult<PeerRef> {
         let id = PeerId::from_bot_api_dialog_id(dialog_id)
             .ok_or_else(|| format!("invalid chat id {dialog_id}"))?;
-        if let Ok(Some(peer_ref)) = self.session.peer_ref(id) {
+        if let Ok(Some(peer_ref)) = self.session.peer_ref(id).await {
             return Ok(peer_ref);
         }
         if let Some(peer) = self.peers.lock().await.get(&dialog_id) {
@@ -163,8 +163,7 @@ impl Tg {
     /// Returns (dialog_id, peer) list, oldest first like kuni (reversed getChats result).
     pub async fn warm_cache_dialogs(&self, limit: usize) -> TgResult<Vec<(i64, Peer)>> {
         let mut ids = Vec::new();
-        let mut iter = self.client.iter_dialogs();
-        iter.limit(limit);
+        let mut iter = self.client.iter_dialogs().limit(limit);
         while let Some(dialog) = iter.next().await.map_err(err)? {
             let peer = dialog.peer;
             if let Some(id) = peer.id().bot_api_dialog_id() {
@@ -291,9 +290,9 @@ impl Tg {
             }
 
             // Typo simulation per message.
-            let part = human::apply_typo(part, &mut rng);
+            let part = human::apply_typo(&part, &mut rng);
 
-            let input = InputMessage::text(part).reply_to(reply_to);
+            let input = InputMessage::new().text(part).reply_to(reply_to);
             self.client.send_message(peer, input).await.map_err(err)?;
             {
                 let mut streaks = self.streaks.lock().await;
@@ -314,7 +313,7 @@ impl Tg {
     ) -> TgResult<()> {
         let peer = self.peer_ref(dialog_id).await?;
         self.client
-            .edit_message(peer, message_id, InputMessage::text(text))
+            .edit_message(peer, message_id, InputMessage::new().text(text))
             .await
             .map_err(err)?;
         Ok(())
@@ -386,7 +385,12 @@ impl Tg {
             .iter_participants(peer)
             .filter(tl::enums::ChannelParticipantsFilter::Admins);
         while let Some(participant) = iter.next().await.map_err(err)? {
-            let rank = participant.role.rank().map(|r| r.to_string());
+            let rank = match &participant.role {
+                grammers_client::peer::Role::Admin(admin) => {
+                    admin.rank().map(str::to_string)
+                }
+                _ => None,
+            };
             let user = participant.user;
             self.remember_peer(&Peer::User(user.clone())).await;
             out.push((user, rank));

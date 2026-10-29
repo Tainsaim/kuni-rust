@@ -66,6 +66,11 @@ pub fn random_wpm(min: i32, max: i32, rng: &mut impl Rng) -> f64 {
     rng.random_range(min as f64..=(max as f64 + 1.0)).clamp(1.0, 400.0)
 }
 
+/// Basic Cyrillic detection (no std method for this).
+fn is_cyrillic(c: char) -> bool {
+    matches!(c, '\u{0410}'..='\u{044F}' | '\u{0401}' | '\u{0451}' | '\u{0400}'..='\u{040F}')
+}
+
 fn latin_neighbors(c: &str) -> &'static [&'static str] {
     match c {
         "q" => &["w", "a"],
@@ -112,7 +117,7 @@ fn cyrillic_neighbors(c: char) -> &'static [&'static str] {
         'з' => &["щ", "х", "ж", "д"],
         'х' => &["з", "ъ", "э", "ж"],
         'ъ' => &["х", "э"],
-        'ф' => &["й", "ы", "я", "ц"],
+        'ф' => &["й", "ы", "я", "ц", "а"],
         'ы' => &["ф", "в", "п", "и", "с", "а", "я", "ц", "у"],
         'в' => &["ы", "а", "п", "с", "у", "к", "е", "м"],
         'а' => &["ф", "п", "м", "и", "я", "в", "ы"],
@@ -123,7 +128,6 @@ fn cyrillic_neighbors(c: char) -> &'static [&'static str] {
         'д' => &["л", "ж", "б", "щ", "ч"],
         'ж' => &["д", "э", "ю", "ч"],
         'э' => &["ж", "ю", "х", "ъ"],
-        'ъ' => &["х", "э"],
         'я' => &["ф", "ч", "с", "а", "ы"],
         'ч' => &["я", "с", "б", "и", "ц", "д", "ж"],
         'с' => &["ы", "и", "т", "в", "я", "ч"],
@@ -149,7 +153,7 @@ fn random_neighbor_replacement(word: &str, rng: &mut impl Rng) -> String {
             .to_lowercase()
             .next()
             .unwrap_or(original);
-        let pool: &[&str] = if lower.is_cyrillic() {
+        let pool: &[&str] = if is_cyrillic(lower) {
             cyrillic_neighbors(lower)
         } else {
             latin_neighbors(&lower.to_string())

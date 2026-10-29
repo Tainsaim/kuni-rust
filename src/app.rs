@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use grammers_client::update::Update;
-use grammers_mtsender::SenderPoolHandle;
+use grammers_mtsender::SenderPoolFatHandle;
 
 use crate::config::ConfigHub;
 use crate::llmui;
@@ -14,7 +14,7 @@ use crate::tg::{Tg, TgResult};
 pub struct App {
     pub config: Arc<ConfigHub>,
     pub tg: Arc<Tg>,
-    pub handle: SenderPoolHandle,
+    pub handle: SenderPoolFatHandle,
     my_id: tokio::sync::Mutex<Option<i64>>,
 }
 
@@ -22,7 +22,7 @@ impl App {
     pub async fn new(
         config: Arc<ConfigHub>,
         tg: Arc<Tg>,
-        handle: SenderPoolHandle,
+        handle: SenderPoolFatHandle,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             config,

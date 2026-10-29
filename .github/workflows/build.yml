@@ -17,7 +17,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --locked --color always 2>&1 | tail -n 120
+        run: |
+          set -o pipefail
+          cargo build --locked --color never 2>&1 | tail -n 300
 
       - name: Test
-        run: cargo test --locked --color always 2>&1 | tail -n 60
+        run: |
+          set -o pipefail
+          cargo test --locked --color never 2>&1 | tail -n 100
