@@ -1,8 +1,9 @@
 //! `<message .../>` XML formatting of chat history, a port of kuni's
 //! `llmui::formatChatHistoryMessage` (`src/llmui/telegram.cpp`).
 
-use grammers_client::grammers_tl_types as tl;
-use grammers_client::message::{Media, Message};
+use grammers_client::tl as tl;
+use grammers_client::media::Media;
+use grammers_client::message::Message;
 use grammers_client::peer::Peer;
 
 use crate::tg::Tg;

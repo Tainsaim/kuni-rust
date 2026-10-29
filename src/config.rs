@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use notify::Watcher as _;
 use tokio::sync::{watch, RwLock};
 
 /// Mirrors kuni's `Config::LockdownMode`.
@@ -464,7 +465,7 @@ impl ConfigHub {
     /// Waits until the config changed since `generation`.
     pub async fn changed(&self, generation: u64) -> (Config, u64) {
         let mut rx = self.rx.clone();
-        while rx.borrow() <= &generation {
+        while *rx.borrow() <= generation {
             if rx.changed().await.is_err() {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }

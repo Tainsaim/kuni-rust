@@ -1,6 +1,6 @@
 //! `<chat .../>` listing, a port of kuni's `llmui::formatChatSingle`.
 
-use grammers_client::grammers_tl_types as tl;
+use grammers_client::tl as tl;
 use grammers_client::message::Message;
 use grammers_client::peer::Peer;
 

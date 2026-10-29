@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use grammers_client::client::SignInError;
-use grammers_client::grammers_tl_types as tl;
+use grammers_client::tl as tl;
 use grammers_client::message::{InputMessage, InputReactions, Message};
 use grammers_client::peer::{Peer, User};
 use grammers_client::Client;
