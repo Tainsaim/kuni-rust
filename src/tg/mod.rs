@@ -383,7 +383,7 @@ impl Tg {
         let mut iter = self
             .client
             .iter_participants(peer)
-            .filter(tl::enums::ChannelParticipantsFilter::Admins);
+            .filter(tl::enums::ChannelParticipantsFilter::ChannelParticipantsAdmins);
         while let Some(participant) = iter.next().await.map_err(err)? {
             let rank = match &participant.role {
                 grammers_client::peer::Role::Admin(admin) => {

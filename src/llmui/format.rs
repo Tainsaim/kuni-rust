@@ -45,15 +45,13 @@ pub fn media_marker(media: &Media) -> String {
                 _ => return "[file]".to_string(),
             };
             let mut animated = false;
-            let mut voice = false;
-            let mut video = false;
-            let mut video_note = false;
+            let voice = doc.raw.voice;
+            let video = doc.raw.video;
+            let video_note = doc.raw.round;
             let mut sticker = false;
             for attr in attrs {
                 match attr {
-                    tl::enums::DocumentAttribute::Animated(_) => animated = true,
-                    tl::enums::DocumentAttribute::Audio(audio) => voice = audio.voice,
-                    tl::enums::DocumentAttribute::Video(video) => video_note = video.video_note,
+                    tl::enums::DocumentAttribute::Animated => animated = true,
                     tl::enums::DocumentAttribute::Sticker(_) => sticker = true,
                     _ => {}
                 }
@@ -69,7 +67,7 @@ pub fn media_marker(media: &Media) -> String {
             } else if video {
                 "[video]".to_string()
             } else {
-                match doc.raw.file_name.as_ref().map(|f| f.as_str()) {
+                match doc.name() {
                     Some(name) => format!("[file {}]", html_escape(name)),
                     None => "[file]".to_string(),
                 }
@@ -209,9 +207,9 @@ fn peer_ref_id(
     peer: &tl::enums::Peer,
 ) -> Result<i64, String> {
     match peer {
-        tl::enums::Peer::PeerUser(user) => Ok(user.user_id),
-        tl::enums::Peer::PeerChat(chat) => Ok(-chat.chat_id),
-        tl::enums::Peer::PeerChannel(channel) => {
+        tl::enums::Peer::User(user) => Ok(user.user_id),
+        tl::enums::Peer::Chat(chat) => Ok(-chat.chat_id),
+        tl::enums::Peer::Channel(channel) => {
             Ok(-1000000000000 - channel.channel_id)
         }
     }

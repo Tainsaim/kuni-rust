@@ -96,7 +96,7 @@ pub fn format_chat_list(
 /// Unread count of a dialog, decoded from the raw TL dialog, or 0.
 pub fn dialog_unread(raw: &tl::enums::Dialog) -> u32 {
     match raw {
-        tl::enums::Dialog::Dialog(dialog) => dialog.unread_count,
+        tl::enums::Dialog::Dialog(dialog) => dialog.unread_count.max(0) as u32,
         _ => 0,
     }
 }
