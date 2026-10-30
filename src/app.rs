@@ -76,7 +76,7 @@ pub struct App {
     /// The long-term memory (kuni's `mDiary`).
     pub diary: Arc<Diary>,
     /// kuni's `mWorkingMemoryLock`: serializes diary dump flows.
-    working_memory_lock: AsyncMutex<()>,
+    working_memory_lock: Arc<AsyncMutex<()>>,
     /// kuni's `mSystemPromptSuffix` (`onCleanContext` output), reset by dumps;
     /// `None` == recompute needed.
     system_prompt_suffix: RwLock<Option<String>>,
@@ -103,7 +103,7 @@ impl App {
             notifications,
             diary,
             currently_opened_chat: std::sync::atomic::AtomicI64::new(0),
-            working_memory_lock: AsyncMutex::new(()),
+            working_memory_lock: Arc::new(AsyncMutex::new(())),
             system_prompt_suffix: RwLock::new(None),
             worker_sessions: StdMutex::new(Vec::new()),
         }

@@ -314,6 +314,7 @@ async fn ask_query_diary(
     search_opts.max_entry_count *= 10;
     let response = app.diary.query(&embedding, search_opts).await?;
 
+    let had_any_results = !response.is_empty();
     let mut formatted_response = String::new();
     {
         let mut taken: Vec<crate::diary::EntryExAndRelatedness> = Vec::new();
@@ -353,7 +354,7 @@ async fn ask_query_diary(
         }
     }
     if formatted_response.is_empty() {
-        if !response.is_empty() {
+        if had_any_results {
             return Ok("All memory pieces conforming your query were provided already. Use other query.".to_string());
         }
         return Ok("No data was found".to_string());
@@ -1162,7 +1163,7 @@ pub fn send_telegram_message(app: Arc<App>, opened: Arc<OpenedChat>) -> Tool {
                         opened.title
                     ));
                 }
-                let mut message = ctx.arg_str("text").unwrap_or_default().replace('\r', "");
+                let message = ctx.arg_str("text").unwrap_or_default().replace('\r', "");
                 let reply_to = reply_to_message_id(&ctx, &opened)?;
 
                 if message.is_empty() {
