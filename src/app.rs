@@ -16,8 +16,8 @@ use crate::llm::Llm;
 use crate::llmui;
 use crate::notifications::{Notification, NotificationManager};
 use crate::prompts::{PromptStore, PromptVars};
-use crate::tg::{Tg, TgResult};
-use crate::tools::{self, Ctx, OpenAITools};
+use crate::tg::Tg;
+use crate::tools::{self, Ctx};
 
 /// The kind of a chat: determines the available tools and instructions
 /// (kuni's chatType switch in `llmuiOpenTelegramChat`).

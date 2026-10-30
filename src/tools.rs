@@ -129,7 +129,7 @@ impl OpenAITools {
     }
 
     pub fn as_json(&self) -> Vec<Value> {
-        let mut guard = self.tools.lock().unwrap();
+        let guard = self.tools.lock().unwrap();
         guard
             .values()
             .map(|tool| {
@@ -345,7 +345,7 @@ pub fn escape_tool(name: &'static str, description: &str, pause_flag: Arc<Atomic
         description: description.into(),
         properties: vec![],
         required: vec![],
-        handler: Arc::new(move |ctx| {
+        handler: Arc::new(move |_ctx| {
             let pause_flag = pause_flag.clone();
             Box::pin(async move {
                 pause_flag.store(true, Ordering::SeqCst);
@@ -365,7 +365,7 @@ chats and unread chats, or to start a new conversation."
             .into(),
         properties: vec![],
         required: vec![],
-        handler: Arc::new(move |ctx| {
+        handler: Arc::new(move |_ctx| {
             let app = app.clone();
             Box::pin(async move {
                 let chats = app.tg.get_chats(50).await?;
