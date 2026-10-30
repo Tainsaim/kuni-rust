@@ -658,7 +658,7 @@ async fn diary_dump_impl(
     // kuni's try_lock loop over mWorkingMemoryLock.
     let lock = app.working_memory_lock.clone();
     let _guard = loop {
-        if let Some(guard) = lock.try_lock() {
+        if let Ok(guard) = lock.try_lock() {
             break guard;
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
