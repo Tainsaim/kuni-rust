@@ -106,12 +106,16 @@ fn sender_name(peer: &Peer) -> String {
 
 /// One chat history message as the LLM sees it, recursively prepending the replied-to
 /// message (kuni's recursive `reply_to` formatting).
+///
+/// `xml_tag` is the tag opening name: "message" by default; kuni's `formatChatHistoryMessage`
+/// extended callers pass e.g. "message target" or "message chat_id=\"123\"".
 pub async fn format_history_message(
     tg: &Tg,
     message: &Message,
     my_id: i64,
     character_name: &str,
     depth: u8,
+    xml_tag: &str,
 ) -> Result<String, String> {
     if depth > 5 {
         // Guard against pathological reply chains.
@@ -122,7 +126,8 @@ pub async fn format_history_message(
         .and_then(|id| id.bot_api_dialog_id())
         .unwrap_or(0);
     let mut line = String::new();
-    line.push_str("<message");
+    line.push('<');
+    line.push_str(xml_tag);
     line.push_str(&format!(" message_id={}", xml_attr(message.id().to_string())));
     line.push_str(&format!(
         " date={}",
@@ -167,7 +172,14 @@ pub async fn format_history_message(
         if depth < 5 {
             if let Ok(Some(reply)) = message.get_reply().await {
                 if let Ok(formatted) =
-                    Box::pin(format_history_message(tg, &reply, my_id, character_name, depth + 1))
+                    Box::pin(format_history_message(
+                        tg,
+                        &reply,
+                        my_id,
+                        character_name,
+                        depth + 1,
+                        "message",
+                    ))
                         .await
                 {
                     line.push_str(&formatted);

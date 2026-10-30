@@ -37,6 +37,16 @@ fn middle_truncate(s: &str, max_chars: usize) -> String {
     out
 }
 
+/// Best-effort chat/sender title for a cached peer.
+pub fn peer_title(peer: &Peer) -> String {
+    match peer {
+        Peer::User(user) => user.full_name(),
+        Peer::Group(group) => group.title().unwrap_or("unnamed group").to_string(),
+        Peer::Channel(channel) => channel.title().to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
 /// Single dialog as the LLM sees it:
 /// `<chat chat_id="…" title="…" preview="{sender}: {text}" type="…" last_message="{x ago}" [unread_count="N"] />`
 pub fn format_chat_single(

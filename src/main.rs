@@ -1,9 +1,15 @@
-//! Entry point: config bootstrap, Telegram connection and the Phase 1 smoke run.
+//! Entry point: config bootstrap, Telegram connection, LLM + workers wiring
+//! (kuni's AUI_ENTRY).
 
 mod app;
 mod config;
+mod llm;
 mod llmui;
+mod notifications;
+mod prompts;
+mod tools;
 mod tg;
+mod worker;
 
 use anyhow::Result;
 use grammers_client::Client;
@@ -26,6 +32,11 @@ async fn main() -> Result<()> {
 
     let config = config::ConfigHub::bootstrap(std::path::Path::new("config.toml")).await?;
     let cfg = config.get().await;
+    println!("Lockdown mode enabled: {:?}", cfg.general.lockdown);
+
+    if !cfg.general.telegram_enabled {
+        anyhow::bail!("telegram_enabled=false is not supported in this kernel!");
+    }
 
     let (tg, pool) = tg::Tg::setup(SESSION_FILE, cfg.general.telegram_api_id).await?;
     let SenderPool {
@@ -41,9 +52,20 @@ async fn main() -> Result<()> {
     tg.set_online(true).await.map_err(anyhow::Error::msg)?;
     println!("Online. Waiting for messages (Ctrl+C to quit)...");
 
-    let app = app::App::new(config, tg.clone(), handle.clone()).await?;
-    app.init().await?;
+    let llm = llm::Llm::new(config.clone())?;
+    let prompts = prompts::PromptStore::bootstrap(std::path::Path::new("prompts")).await?;
+    let notifications = notifications::NotificationManager::new();
+    let app = std::sync::Arc::new(app::App::new(
+        config.clone(),
+        tg.clone(),
+        handle.clone(),
+        llm,
+        prompts,
+        notifications,
+    ));
+    app::init(&app).await?;
     app.refresh_config().await;
+    worker::spawn_workers(&app).await;
 
     let client = Client::new(handle.clone());
     let mut stream = client
@@ -56,7 +78,7 @@ async fn main() -> Result<()> {
             _ = tokio::signal::ctrl_c() => break,
             update = stream.next() => {
                 match update {
-                    Ok(update) => app.handle_update(update).await,
+                    Ok(update) => app::on_update(&app, update).await,
                     Err(e) => {
                         tracing::error!("update stream error: {e}");
                         break;

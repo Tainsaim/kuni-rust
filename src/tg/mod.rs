@@ -20,6 +20,14 @@ use crate::tg::human::{err, SendGate, SendStreak, TYPING_DELAY_GRACE};
 
 pub type TgResult<T> = Result<T, String>;
 
+/// One recent dialog summary for the chat list tools.
+pub struct ChatListEntry {
+    pub id: i64,
+    pub peer: Peer,
+    pub unread: u32,
+    pub last_message: Option<Message>,
+}
+
 /// Everything that behaves like a person when sending messages on Telegram.
 pub struct Tg {
     pub client: Client,
@@ -29,6 +37,16 @@ pub struct Tg {
     streaks: tokio::sync::Mutex<HashMap<i64, SendStreak>>,
     typing_min_wpm: std::sync::atomic::AtomicI32,
     typing_max_wpm: std::sync::atomic::AtomicI32,
+    /// kuni's global embedding cache for anti-repeat (text -> embedding).
+    pub anti_repeat_cache: std::sync::Mutex<HashMap<String, Vec<f64>>>,
+    /// kuni's shared "head start" relaxation value, bumped on repeats and cleared on
+    /// success (kuni's `pEventLoop global soak`).
+    pub anti_repeat_head_start: std::sync::Mutex<f64>,
+    /// Cached contact list ids for the CONTACTS_ONLY lockdown mode (kuni's static
+    /// contacts lookup).
+    contacts: tokio::sync::Mutex<Option<Vec<i64>>>,
+    /// Cached own user id (0 = unset), kuni's `myId()`.
+    my_id_cache: std::sync::atomic::AtomicI64,
 }
 
 impl Tg {
@@ -46,6 +64,10 @@ impl Tg {
             streaks: tokio::sync::Mutex::new(HashMap::new()),
             typing_min_wpm: std::sync::atomic::AtomicI32::new(120),
             typing_max_wpm: std::sync::atomic::AtomicI32::new(150),
+            anti_repeat_cache: std::sync::Mutex::new(HashMap::new()),
+            anti_repeat_head_start: std::sync::Mutex::new(0.0),
+            contacts: tokio::sync::Mutex::new(None),
+            my_id_cache: std::sync::atomic::AtomicI64::new(0),
         });
         Ok((tg, pool))
     }
@@ -126,9 +148,44 @@ impl Tg {
 
     /// Telegram user id of the logged-in account (kuni's `myId()`).
     pub async fn my_id(&self) -> TgResult<i64> {
+        let cached = self.my_id_cache.load(std::sync::atomic::Ordering::SeqCst);
+        if cached != 0 {
+            return Ok(cached);
+        }
         let me = self.client.get_me().await.map_err(err)?;
         self.remember_peer(&Peer::User(me.clone())).await;
-        me.id().bot_api_dialog_id().ok_or_else(|| "cannot get own id".to_string())
+        let id = me
+            .id()
+            .bot_api_dialog_id()
+            .ok_or_else(|| "cannot get own id".to_string())?;
+        self.my_id_cache.store(id, std::sync::atomic::Ordering::SeqCst);
+        Ok(id)
+    }
+
+    /// Cached-only variant of `my_id` for hot paths (returns the id without cache
+    /// refill; callers use `my_id()` once at startup).
+    pub async fn my_id_cached(&self) -> TgResult<i64> {
+        self.my_id().await
+    }
+
+    /// Best-effort chat title from the peer cache (fallback "<unknown>").
+    pub async fn chat_title(&self, dialog_id: i64) -> String {
+        let peer = match self.chat(dialog_id).await {
+            Some(peer) => peer,
+            None => match self
+                .peer_ref(dialog_id)
+                .await
+                .ok()
+                .and_then(|r| self.client.resolve_peer(r).ok().flatten())
+            {
+                Some(peer) => {
+                    self.remember_peer(&peer).await;
+                    peer
+                }
+                None => return "<unknown>".to_string(),
+            },
+        };
+        crate::llmui::dialog::peer_title(&peer)
     }
 
     /// Resolves a Bot-API-style dialog id (what the LLM sees everywhere) into a `PeerRef`
@@ -159,20 +216,30 @@ impl Tg {
         self.peers.lock().await.get(&dialog_id).cloned()
     }
 
-    /// Loads recent dialogs into the peer cache (the kuni `getChats(chatListMain, N)` warm-up).
-    /// Returns (dialog_id, peer) list, oldest first like kuni (reversed getChats result).
-    pub async fn warm_cache_dialogs(&self, limit: usize) -> TgResult<Vec<(i64, Peer)>> {
-        let mut ids = Vec::new();
+    /// Fetches recent dialogs into the peer cache and returns their summaries
+    /// (kuni's `getChats(chatListMain, N)`), oldest first like kuni.
+    pub async fn get_chats(&self, limit: usize) -> TgResult<Vec<ChatListEntry>> {
+        let mut out = Vec::new();
         let mut iter = self.client.iter_dialogs().limit(limit);
         while let Some(dialog) = iter.next().await.map_err(err)? {
             let peer = dialog.peer;
             if let Some(id) = peer.id().bot_api_dialog_id() {
-                self.peers.lock().await.insert(id, peer.clone());
-                ids.push((id, peer));
+                let unread = crate::llmui::dialog::dialog_unread(&dialog.raw);
+                out.push(ChatListEntry {
+                    id,
+                    peer,
+                    unread,
+                    last_message: dialog.last_message,
+                });
             }
         }
-        ids.reverse();
-        Ok(ids)
+        out.reverse();
+        Ok(out)
+    }
+
+    /// Startup warm cache (legacy helper, kept for `App::init`).
+    pub async fn warm_cache_dialogs(&self, limit: usize) -> TgResult<Vec<ChatListEntry>> {
+        self.get_chats(limit).await
     }
 
     /// Fetches a window of history. Returns messages **oldest first**, trimming
@@ -238,12 +305,13 @@ impl Tg {
     /// The human-aware message sending pipeline (kuni's `telegramPostMessage`):
     /// rate gate -> typing simulation -> typo simulation -> send, with the
     /// `messagesInARow` guard (>= 10 in a row: fail).
+    /// Returns the message ids sent (one per split part).
     pub async fn send_text(
         &self,
         dialog_id: i64,
         text: &str,
         reply_to: Option<i32>,
-    ) -> TgResult<()> {
+    ) -> TgResult<Vec<i32>> {
         let texts = human::split_for_sending(text);
         if texts.is_empty() {
             return Err("empty message".to_string());
@@ -260,6 +328,7 @@ impl Tg {
             }
         }
         let peer = self.peer_ref(dialog_id).await?;
+        let mut sent_ids = Vec::new();
         for part in texts {
             self.gate.wait().await;
             let mut rng = rand::rng();
@@ -292,8 +361,12 @@ impl Tg {
             // Typo simulation per message.
             let part = human::apply_typo(&part, &mut rng);
 
+            // LLM uses "—" (long dash) instead of "-". Fix it (kuni's sendTelegramMessage).
+            let part = part.replace('—', "-");
+
             let input = InputMessage::new().text(part).reply_to(reply_to);
-            self.client.send_message(peer, input).await.map_err(err)?;
+            let sent = self.client.send_message(peer, input).await.map_err(err)?;
+            sent_ids.push(sent.id());
             {
                 let mut streaks = self.streaks.lock().await;
                 let streak = streaks.entry(dialog_id).or_insert_with(SendStreak::new);
@@ -301,7 +374,7 @@ impl Tg {
                 streak.last = std::time::Instant::now();
             }
         }
-        Ok(())
+        Ok(sent_ids)
     }
 
     /// Edits a previously sent message's text.
@@ -396,5 +469,117 @@ impl Tg {
             out.push((user, rank));
         }
         Ok(out)
+    }
+
+    /// Prevents a user from DM-ing the account (kuni's `setMessageSenderBlockList`,
+    /// TL contacts.block).
+    pub async fn block_user(&self, user_dialog_id: i64) -> TgResult<()> {
+        let peer: tl::enums::InputPeer = self.peer_ref(user_dialog_id).await?.into();
+        self.client
+            .invoke(&tl::functions::contacts::Block {
+                id: peer,
+                my_stories_from: false,
+            })
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// Deletes the whole chat history with `revoke=true` (kuni's `deleteChatHistory`).
+    pub async fn delete_chat_history(&self, dialog_id: i64) -> TgResult<()> {
+        let peer: tl::enums::InputPeer = self.peer_ref(dialog_id).await?.into();
+        self.client
+            .invoke(&tl::functions::messages::DeleteHistory {
+                peer,
+                max_id: 0,
+                min_date: None,
+                max_date: None,
+                just_clear: false,
+                revoke: true,
+            })
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// Leaves a channel/supergroup chat (kuni's `leaveChat`).
+    /// Basic groups are not supported by Grammers' layer here — an error is reported.
+    pub async fn leave_chat(&self, dialog_id: i64) -> TgResult<()> {
+        let channel = match self.chat(dialog_id).await {
+            Some(Peer::Channel(channel)) => channel.raw,
+            _ => {
+                return Err(
+                    "cannot leave this chat (only channels/supergroups are supported)"
+                        .to_string(),
+                )
+            }
+        };
+        let input_channel = tl::types::InputChannel {
+            channel_id: channel.id,
+            access_hash: channel.access_hash,
+        };
+        self.client
+            .invoke(&tl::functions::channels::LeaveChannel {
+                channel: tl::enums::InputChannel::Channel(input_channel),
+            })
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// Resolves a "@username" string into the Bot-API dialog id of that chat.
+    pub async fn resolve_chat_id(&self, query: &str) -> TgResult<i64> {
+        let peer = self.resolve_username(query).await?;
+        peer.and_then(|p| p.id().bot_api_dialog_id())
+            .ok_or_else(|| format!("could not resolve \"{query}\" to a chat"))
+    }
+
+    /// Joins a channel/supergroup chat (kuni's `joinChat`).
+    pub async fn join_chat(&self, dialog_id: i64) -> TgResult<()> {
+        let peer_ref = self.peer_ref(dialog_id).await?;
+        self.client.join_chat(peer_ref).await.map_err(err)?;
+        Ok(())
+    }
+
+    /// Joins a chat by its invite link and returns the dialog id (kuni's
+    /// `joinChatByInviteLink`).
+    pub async fn join_chat_by_invite_link(&self, invite_link: &str) -> TgResult<i64> {
+        let peer = self
+            .client
+            .accept_invite_link(invite_link)
+            .await
+            .map_err(err)?
+            .ok_or_else(|| "could not join chat: no chat in the invite result".to_string())?;
+        self.remember_peer(&peer).await;
+        let id = peer
+            .id()
+            .bot_api_dialog_id()
+            .ok_or_else(|| "could not determine joined chat id".to_string())?;
+        Ok(id)
+    }
+
+    /// The account's contact list (TL contacts.getContacts), cached once like kuni's
+    /// static contacts lookup.
+    pub async fn get_contact_ids(&self) -> TgResult<Vec<i64>> {
+        if let Some(contacts) = self.contacts.lock().await.as_ref() {
+            return Ok(contacts.clone());
+        }
+        let result: tl::enums::contacts::Contacts = self
+            .client
+            .invoke(&tl::functions::contacts::GetContacts { hash: 0 })
+            .await
+            .map_err(err)?;
+        let mut ids = Vec::new();
+        if let tl::enums::contacts::Contacts::Contacts(contacts) = result {
+            for user in contacts.users {
+                let peer = Peer::from_raw(&self.client, user);
+                self.remember_peer(&peer).await;
+                if let Some(id) = peer.id().bot_api_dialog_id() {
+                    ids.push(id);
+                }
+            }
+        }
+        *self.contacts.lock().await = Some(ids.clone());
+        Ok(ids)
     }
 }
