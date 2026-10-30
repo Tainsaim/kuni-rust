@@ -1490,6 +1490,7 @@ pub fn build_open_notification_actions(app: &Arc<App>, chat_id: i64, title: &str
 /// account has not joined). Call order of the tool set matches kuni's OpenAITools{}
 /// initializer (send_telegram_message first).
 pub fn build_chat_tools(
+    app: Arc<App>,
     opened: Arc<OpenedChat>,
     cfg: &crate::config::Config,
     is_member: bool,
@@ -1498,9 +1499,9 @@ pub fn build_chat_tools(
     // you haven't joined, you only see a "Join" button (plus the ability to react to
     // messages) instead of a text field.
     if !matches!(opened.kind, ChatKind::Private) && !is_member {
-        let mut tools = vec![react_with_emoji(opened.clone())];
+        let mut tools = vec![react_with_emoji(app.clone(), opened.clone())];
         if cfg.misc.can_join_chats {
-            tools.push(join_chat(opened.clone()));
+            tools.push(join_chat(app.clone(), opened.clone()));
         }
         return tools;
     }
@@ -1509,27 +1510,30 @@ pub fn build_chat_tools(
     // branch — `#send_telegram_message tool is not available`).
     if opened.kind == ChatKind::Channel {
         return vec![
-            react_with_emoji(opened.clone()),
-            forward_message(opened.clone()),
+            react_with_emoji(app.clone(), opened.clone()),
+            forward_message(app.clone(), opened.clone()),
         ];
     }
 
     let mut tools = vec![
-        send_telegram_message(opened.clone()),
-        get_chat_photo(opened.clone()),
-        react_with_emoji(opened.clone()),
-        remove_message(opened.clone()),
-        edit_message_text(opened.clone()),
-        forward_message(opened.clone()),
+        send_telegram_message(app.clone(), opened.clone()),
+        get_chat_photo(app.clone(), opened.clone()),
+        react_with_emoji(app.clone(), opened.clone()),
+        remove_message(app.clone(), opened.clone()),
+        edit_message_text(app.clone(), opened.clone()),
+        forward_message(app.clone(), opened.clone()),
     ];
 
     if matches!(opened.kind, ChatKind::Group) {
         if cfg.misc.can_leave_chats {
-            tools.push(leave_chat(opened.clone()));
+            tools.push(leave_chat(app.clone(), opened.clone()));
         }
         if opened.is_admin {
-            tools.push(group_admin_remove_message(opened.clone()));
-            tools.push(group_admin_ban_user(opened.clone()));
+            tools.push(group_admin_remove_message(
+                app.clone(),
+                opened.clone(),
+            ));
+            tools.push(group_admin_ban_user(app.clone(), opened.clone()));
             // tools::groupAdminSetUserTag lands with the diary/tags phase.
         }
     }

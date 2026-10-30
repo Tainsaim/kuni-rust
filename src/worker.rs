@@ -100,10 +100,9 @@ impl Worker {
                     return;
                 }
                 use grammers_tl_types as tl;
-                let action =
-                    tl::enums::SendMessageAction::SendMessageTypingAction(
-                        tl::types::SendMessageTypingAction {},
-                    );
+                let action = tl::enums::SendMessageAction::Typing(
+                    tl::types::SendMessageTypingAction {},
+                );
                 if let Err(e) = app.tg.send_action(chat_id, action).await {
                     tracing::debug!("typing indicator failed: {e}");
                 }

@@ -59,7 +59,7 @@ pub struct App {
     pub tg: Arc<Tg>,
     pub handle: grammers_mtsender::SenderPoolFatHandle,
     pub llm: Llm,
-    pub prompts: PromptStore,
+    pub prompts: Arc<PromptStore>,
     pub notifications: NotificationManager,
     /// Dialog id of the chat the LLM currently generates a reply in
     /// (kuni's `mCurrentlyOpenedChat`, used by the typing indicator); 0 = none.
@@ -72,7 +72,7 @@ impl App {
         tg: Arc<Tg>,
         handle: grammers_mtsender::SenderPoolFatHandle,
         llm: Llm,
-        prompts: PromptStore,
+        prompts: Arc<PromptStore>,
         notifications: NotificationManager,
     ) -> Self {
         Self {
@@ -461,7 +461,7 @@ pub async fn open_telegram_chat(app: &Arc<App>, ctx: &Ctx, chat_id: i64) -> Resu
         result += &format!(
             "\n<instructions>\nYou are NOT a member of \"{title}\". You can't send messages here; you can only #react_with_emoji to messages, or use\n#join_chat to become a member (after which you'll be able to fully participate the next time you open this chat).\n</instructions>"
         );
-        ctx.replace_tools(tools::build_chat_tools(opened, &cfg, false));
+        ctx.replace_tools(tools::build_chat_tools(app.clone(), opened, &cfg, false));
         app.currently_opened_chat
             .store(chat_id, std::sync::atomic::Ordering::SeqCst);
         return Ok(result);
@@ -487,14 +487,14 @@ pub async fn open_telegram_chat(app: &Arc<App>, ctx: &Ctx, chat_id: i64) -> Resu
                 "\n<instructions>\nYou are in telegram channel (also known as supergroup) called \\\"{title}\\\".\nPay close attention to these messages. Acquire context from them. You can't respond in telegram channels\n(#send_telegram_message tool is not available). Instead, do what you usually do when reading newsletters: reflect and reason\non them.\nSome channels have reactions enabled. In that case, you can sometimes react with #react_with_emoji to express your feelings about a message, but you can't send a full reply.\n\nForwarding posts:\nIf you find a post genuinely interesting, funny, or relevant to someone you know — you can forward it to another chat\nusing #forward_message. Be selective: only forward posts that are truly worth sharing. You can add a short comment\nexpressing your reaction. Use #get_telegram_chats to find the destination chat_id if needed.\nDo NOT forward ads, sponsored posts, or low-value content.\n</instructions>"
             );
             // no send_telegram_message for channels
-            ctx.replace_tools(tools::build_chat_tools(opened, &cfg, is_member));
+            ctx.replace_tools(tools::build_chat_tools(app.clone(), opened, &cfg, is_member));
             app.currently_opened_chat
                 .store(chat_id, std::sync::atomic::Ordering::SeqCst);
             return Ok(result);
         }
     }
 
-    ctx.replace_tools(tools::build_chat_tools(opened, &cfg, is_member));
+    ctx.replace_tools(tools::build_chat_tools(app.clone(), opened, &cfg, is_member));
     app.currently_opened_chat
         .store(chat_id, std::sync::atomic::Ordering::SeqCst);
     Ok(result)

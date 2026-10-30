@@ -19,7 +19,7 @@ jobs:
       - name: Build
         run: |
           set -o pipefail
-          cargo build --locked --color never 2>&1 | tail -n 300
+          cargo build --locked --color never 2>&1 | tail -n 2000
 
       - name: Test
         run: |

@@ -331,7 +331,8 @@ impl Tg {
         let mut sent_ids = Vec::new();
         for part in texts {
             self.gate.wait().await;
-            let mut rng = rand::rng();
+            // StdRng (not ThreadRng, which is !Send) so it may live across awaits.
+            let mut rng = rand::rngs::StdRng::from_entropy();
 
             // Typing simulation: only when the previous message in the chat is recent
             // (kuni: typing delay applies if the previous message was sent < 5s ago).
@@ -352,7 +353,9 @@ impl Tg {
                 let _ = self
                     .send_action(
                         dialog_id,
-                        tl::enums::SendMessageAction::SendMessageTypingAction,
+                        tl::enums::SendMessageAction::Typing(
+                            tl::types::SendMessageTypingAction {},
+                        ),
                     )
                     .await;
                 tokio::time::sleep(delay).await;
