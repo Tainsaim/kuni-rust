@@ -11,6 +11,7 @@ use grammers_client::tl as tl;
 use grammers_client::message::{InputMessage, InputReactions, Message};
 use grammers_client::peer::{Peer, User};
 use grammers_client::Client;
+use rand::SeedableRng;
 use grammers_mtsender::SenderPool;
 use grammers_session::storages::SqliteSession;
 use grammers_session::types::{PeerId, PeerRef};

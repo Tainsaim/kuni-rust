@@ -680,7 +680,7 @@ around it (e.g. to understand what was being discussed).\n\
                 }
 
                 let cfg = app.config.get().await;
-                let my_id = app.tg.my_id().await?
+                let my_id = app.tg.my_id().await?;
                 let peer = app.tg.peer_ref(chat_id).await?;
 
                 // Newer messages (ids > target), oldest first.
