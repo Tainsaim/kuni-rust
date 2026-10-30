@@ -165,6 +165,18 @@ impl OpenAITools {
         self.len() == 0
     }
 
+    /// Up-to-date copy of the tool map (for worker merges).
+    pub fn snapshot(&self) -> BTreeMap<String, Tool> {
+        self.tools.lock().unwrap().clone()
+    }
+
+    /// Names in execution order for the "What's your next action?" hint
+    /// (kuni's `keyVector()`).
+    pub fn names(&self) -> Vec<String> {
+        self.tools.lock().unwrap().keys().cloned().collect()
+    }
+}
+
 /// What a handler sees (kuni's `OpenAITools::Ctx`).
 pub struct Ctx {
     pub app: Arc<App>,
@@ -203,17 +215,6 @@ impl Ctx {
 }
 
 impl OpenAITools {
-    /// Up-to-date copy of the tool map (for worker merges).
-    pub fn snapshot(&self) -> BTreeMap<String, Tool> {
-        self.tools.lock().unwrap().clone()
-    }
-
-    /// Names in execution order for the "What's your next action?" hint
-    /// (kuni's `keyVector()`).
-    pub fn names(&self) -> Vec<String> {
-        self.tools.lock().unwrap().keys().cloned().collect()
-    }
-
     /// Executes the tool calls, producing one `tool` result message per call
     /// (kuni's `handleToolCalls`).
     pub async fn handle_tool_calls(
