@@ -172,18 +172,19 @@ impl Tg {
     pub async fn chat_title(&self, dialog_id: i64) -> String {
         let peer = match self.chat(dialog_id).await {
             Some(peer) => peer,
-            None => match self
-                .peer_ref(dialog_id)
-                .await
-                .ok()
-                .and_then(|r| self.client.resolve_peer(r).ok().flatten())
-            {
-                Some(peer) => {
-                    self.remember_peer(&peer).await;
-                    peer
+            None => {
+                let resolved = match self.peer_ref(dialog_id).await.ok() {
+                    Some(peer_ref) => self.client.resolve_peer(peer_ref).await.ok(),
+                    None => None,
+                };
+                match resolved {
+                    Some(peer) => {
+                        self.remember_peer(&peer).await;
+                        peer
+                    }
+                    None => return "<unknown>".to_string(),
                 }
-                None => return "<unknown>".to_string(),
-            },
+            }
         };
         crate::llmui::dialog::peer_title(&peer)
     }
@@ -332,7 +333,8 @@ impl Tg {
         for part in texts {
             self.gate.wait().await;
             // StdRng (not ThreadRng, which is !Send) so it may live across awaits.
-            let mut rng = rand::rngs::StdRng::from_entropy();
+            let mut rng =
+                rand::rngs::StdRng::from_rng(&mut rand::rng()).expect("rng seed");
 
             // Typing simulation: only when the previous message in the chat is recent
             // (kuni: typing delay applies if the previous message was sent < 5s ago).
@@ -353,9 +355,7 @@ impl Tg {
                 let _ = self
                     .send_action(
                         dialog_id,
-                        tl::enums::SendMessageAction::Typing(
-                            tl::types::SendMessageTypingAction {},
-                        ),
+                        tl::enums::SendMessageAction::SendMessageTypingAction,
                     )
                     .await;
                 tokio::time::sleep(delay).await;
@@ -519,7 +519,7 @@ impl Tg {
         };
         let input_channel = tl::types::InputChannel {
             channel_id: channel.id,
-            access_hash: channel.access_hash,
+            access_hash: channel.access_hash.unwrap_or(0),
         };
         self.client
             .invoke(&tl::functions::channels::LeaveChannel {
@@ -575,7 +575,8 @@ impl Tg {
         let mut ids = Vec::new();
         if let tl::enums::contacts::Contacts::Contacts(contacts) = result {
             for user in contacts.users {
-                let peer = Peer::from_raw(&self.client, user);
+                let peer =
+                    grammers_client::peer::Peer::from_user(&self.client, user);
                 self.remember_peer(&peer).await;
                 if let Some(id) = peer.id().bot_api_dialog_id() {
                     ids.push(id);

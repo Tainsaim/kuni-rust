@@ -54,7 +54,8 @@ async fn main() -> Result<()> {
 
     let llm = llm::Llm::new(config.clone())?;
     let prompts = prompts::PromptStore::bootstrap(std::path::Path::new("prompts")).await?;
-    let notifications = notifications::NotificationManager::new();
+    let notifications =
+        std::sync::Arc::new(notifications::NotificationManager::new());
     let app = std::sync::Arc::new(app::App::new(
         config.clone(),
         tg.clone(),

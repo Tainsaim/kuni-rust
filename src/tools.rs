@@ -98,6 +98,7 @@ fn prop_json(p: &Prop) -> Value {
     obj
 }
 
+#[derive(Clone)]
 pub struct Tool {
     pub name: String,
     pub description: String,
@@ -344,7 +345,7 @@ pub fn escape_tool(name: &'static str, description: &str, pause_flag: Arc<Atomic
             let pause_flag = pause_flag.clone();
             Box::pin(async move {
                 pause_flag.store(true, Ordering::SeqCst);
-                "Success".to_string()
+                Ok("Success".to_string())
             })
         }),
     }
@@ -457,7 +458,7 @@ fn chat_matches(peer: &grammers_client::peer::Peer, query: &str) -> bool {
     let name = |s: &str| s.to_lowercase().contains(&q);
     match peer {
         grammers_client::peer::Peer::User(u) => {
-            name(u.full_name()) || u.username().map(|u| name(u)).unwrap_or(false)
+            name(&u.full_name()) || u.username().map(|un| name(&un)).unwrap_or(false)
         }
         grammers_client::peer::Peer::Group(g) => {
             g.title().map(|t| name(t)).unwrap_or(false)
@@ -535,6 +536,7 @@ to_days_ago=1 means \"between a week ago and yesterday\". Omit both to search th
                     .unwrap_or(20);
 
                 let my_id = app
+                    .tg
                     .my_id()
                     .await
                     .map_err(anyhow_to_string)?;
@@ -599,11 +601,12 @@ to_days_ago=1 means \"between a week ago and yesterday\". Omit both to search th
                             continue;
                         }
                         // Don't leak chats that are off-limits under lockdown.
-                        if m.peer()
-                            .and_then(|p| p.id().bot_api_dialog_id())
-                            .is_some_and(|id| !app.is_accessible_lockdown(id).await)
+                        if let Some(chat_id) =
+                            m.peer().and_then(|p| p.id().bot_api_dialog_id())
                         {
-                            continue;
+                            if !app.is_accessible_lockdown(chat_id).await {
+                                continue;
+                            }
                         }
                         results.push(m);
                     }
@@ -681,7 +684,7 @@ around it (e.g. to understand what was being discussed).\n\
                 }
 
                 let cfg = app.config.get().await;
-                let my_id = app.my_id().await.map_err(anyhow_to_string)?;
+                let my_id = app.tg.my_id().await.map_err(anyhow_to_string)?;
                 let peer = app.tg.peer_ref(chat_id).await?;
 
                 // Newer messages (ids > target), oldest first.
@@ -780,7 +783,7 @@ specific user to DM you.\nYou should use this if:\n\
                     return Ok("Failed".to_string());
                 }
 
-                match app.chat_kind(chat_id).await? {
+                match app.chat_kind(chat_id).await {
                     Some(kind) => match kind {
                         ChatKind::Private => {
                             // comment their dickpic.
@@ -1031,7 +1034,7 @@ fn reply_to_message_id(ctx: &Ctx, opened: &OpenedChat) -> Result<Option<i32>, St
     if raw == 0 {
         return Ok(None);
     }
-    if raw == *opened.state.last_reply_to.lock().unwrap() {
+    if raw as i64 == *opened.state.last_reply_to.lock().unwrap() {
         // we don't need to reply to the same message multiple times in a row.
         return Ok(None);
     }
@@ -1040,7 +1043,7 @@ fn reply_to_message_id(ctx: &Ctx, opened: &OpenedChat) -> Result<Option<i32>, St
     if !opened.history().iter().any(|m| m.id() == raw) {
         return Err("You are trying to send a message to another chat!".to_string());
     }
-    *opened.state.last_reply_to.lock().unwrap() = raw;
+    *opened.state.last_reply_to.lock().unwrap() = raw as i64;
     Ok(Some(raw))
 }
 
@@ -1089,17 +1092,17 @@ async fn anti_repeat(app: &App, opened: &OpenedChat, message: &str) -> Result<()
     let max_similarity = praises
         .iter()
         .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
-    let avg_similarity = praises.iter().sum::<f32>() / praises.len() as f32;
+        .fold(f64::NEG_INFINITY, f64::max);
+    let avg_similarity = praises.iter().sum::<f64>() / praises.len() as f64;
 
     let head_start = *app.tg.anti_repeat_head_start.lock().unwrap();
     let bump = 0.07; // relax the repeating-after-yourself check
-    if max_similarity > cfg.misc.anti_repeat_trigger_max as f32 + head_start {
+    if max_similarity > cfg.misc.anti_repeat_trigger_max as f64 + head_start {
         *app.tg.anti_repeat_head_start.lock().unwrap() = head_start + bump;
         tracing::warn!("LLM is repeating itself: (maxSimilarity={max_similarity}) {message}");
         return Err(anti_repeat_prompt(app).await);
     }
-    if avg_similarity > cfg.misc.anti_repeat_trigger_avg as f32 + head_start {
+    if avg_similarity > cfg.misc.anti_repeat_trigger_avg as f64 + head_start {
         *app.tg.anti_repeat_head_start.lock().unwrap() = head_start + bump;
         tracing::warn!("LLM is repeating itself: (avgSimilarity={avg_similarity}) {message}");
         return Err(anti_repeat_prompt(app).await);

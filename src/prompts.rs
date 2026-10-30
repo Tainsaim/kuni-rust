@@ -130,7 +130,7 @@ impl PromptStore {
             .unwrap_or_else(|| DEFAULT_CHARACTER_APPEARANCE.to_string());
         let epilogue_raw =
             read_file("messages_epilogue.md").await.unwrap_or_else(|| DEFAULT_EPILOGUE.to_string());
-        let anti_raw = read_file("anti_repeat.md").await.ok();
+        let anti_raw = read_file("anti_repeat.md").await;
         Ok(RawPrompts {
             system: Self::strip_header(&system_raw).to_string(),
             character_base: Self::strip_header(&base_raw).to_string(),

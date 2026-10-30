@@ -13,8 +13,10 @@ use crate::config::ConfigHub;
 // Message types (OpenAI chat format), kuni's `IOpenAIChat::Message`.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Role {
+    #[default]
+    System,
     System,
     User,
     Assistant,
