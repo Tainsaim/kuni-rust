@@ -97,6 +97,8 @@ pub struct Misc {
     pub diary_injection_max_length: usize,
     pub diary_plagiarism_threshold: f32,
     pub diary_min_relatedness: f32,
+    /// kuni's `capabilityWebSearch` (web module itself lands later).
+    pub capability_web_search: bool,
     pub chat_max_history_length: usize,
     pub llm_temperature: Option<f32>,
     pub llm_top_p: Option<f32>,
@@ -129,7 +131,8 @@ impl Default for Misc {
             diary_token_count_trigger: 40_000,
             diary_injection_max_length: 0,
             diary_plagiarism_threshold: 0.97,
-            diary_min_relatedness: 0.80,
+            diary_min_relatedness: 0.5,
+            capability_web_search: false,
             chat_max_history_length: 2000,
             llm_temperature: Some(0.2),
             llm_top_p: None,
@@ -301,7 +304,8 @@ tool_reminder_probability = 0.02
 diary_token_count_trigger = 40000    # dump context to the diary past this token count
 diary_injection_max_length = 0       # 0 disables relevance-based diary injection
 diary_plagiarism_threshold = 0.97
-diary_min_relatedness = 0.80
+diary_min_relatedness = 0.5          # kuni default; feeds mRelevanceThreshold
+# capability_web_search = false       # kuni's capabilityWebSearch (web module lands later)
 chat_max_history_length = 2000
 llm_temperature = 0.2
 # llm_top_p / llm_top_k / llm_min_p / llm_presence_penalty / llm_repetition_penalty

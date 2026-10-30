@@ -301,8 +301,199 @@ const ASK_SHORT_QUERY: &str = "error: too short query! please provide more conte
 // Global (desktop) tools
 // ---------------------------------------------------------------------------
 
-/// Placeholder of the real `ask` subagent until the Diary module lands (phase 3).
-/// The exact kuni description/parameters are kept so the transition is LLM-visible.
+/// kuni's `queryDiary` (tools/ask.cpp): diary query with the shared `includedIds`
+/// exclusion, scoring and `<memory_piece>` formatting.
+async fn ask_query_diary(
+    app: &Arc<App>,
+    included_ids: &Arc<StdMutex<std::collections::HashSet<String>>>,
+    cue: &str,
+    opts: crate::diary::QueryOpts,
+) -> Result<String, String> {
+    let embedding = app.llm.embed(cue).await.map_err(|e| format!("embedding: {e}"))?;
+    let mut search_opts = opts;
+    search_opts.max_entry_count *= 10;
+    let response = app.diary.query(&embedding, search_opts).await?;
+
+    let mut formatted_response = String::new();
+    {
+        let mut taken: Vec<crate::diary::EntryExAndRelatedness> = Vec::new();
+        {
+            let mut included = included_ids.lock().unwrap();
+            for entry in response {
+                if included.contains(&entry.entry.id) {
+                    continue;
+                }
+                included.insert(entry.entry.id.clone());
+                taken.push(entry);
+                if taken.len() >= opts.max_entry_count {
+                    break;
+                }
+            }
+        }
+        tracing::debug!(
+            "queryDiary cue={} found={}",
+            cue,
+            taken
+                .iter()
+                .map(|e| format!("({}.md,relatedness={})", e.entry.id, e.relatedness))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for item in taken {
+            let mut entry = item.entry.clone();
+            entry.metadata.score += (item.relatedness - 0.5) * 2.0;
+            entry.increment_usage_count();
+            app.diary.save(&entry).await;
+            app.diary.retain(entry).await; // keep the cache copy fresh (kuni mutates in place)
+            formatted_response += &format!(
+                "<memory_piece relatedness=\"{}\">\n{}\n</memory_piece>\n",
+                item.relatedness,
+                item.entry.freeform_body
+            );
+        }
+    }
+    if formatted_response.is_empty() {
+        if !response.is_empty() {
+            return Ok("All memory pieces conforming your query were provided already. Use other query.".to_string());
+        }
+        return Ok("No data was found".to_string());
+    }
+    Ok(formatted_response)
+}
+
+/// kuni's `queryWeb`; the web search module itself is not ported yet (phase 5).
+async fn ask_query_web(app: &Arc<App>) -> String {
+    if !app.config.get().await.misc.capability_web_search {
+        return "No web search available".to_string();
+    }
+    "No web search available".to_string()
+}
+
+/// kuni's `ask()` free function (tools/ask.cpp): the searcher subagent loop.
+async fn ask_subagent(app: &Arc<App>, ctx: &Ctx, query: &str) -> Result<String, String> {
+    let included_ids: Arc<StdMutex<std::collections::HashSet<String>>> =
+        Arc::new(StdMutex::new(std::collections::HashSet::new()));
+    let opts = crate::diary::QueryOpts {
+        confidence_factor: 0.0,
+        max_entry_count: 10,
+    };
+
+    let query_tool = Tool {
+        name: "query".to_string(),
+        description: "Perform embedding-based search on RAG database".to_string(),
+        properties: vec![
+            (
+                "text".to_string(),
+                Prop::new(
+                    Prop::STRING,
+                    "Retrieval cue that is likely to appear in memory pieces. This text will be transformed to embedding as is, and its embedding will be compared against memory pieces. Include as manykeywords as possible; maintain meaning of the request.",
+                ),
+            ),
+            (
+                "include_web_search_results".to_string(),
+                Prop::new(
+                    Prop::BOOLEAN,
+                    "In addition to local database, append with results from web search. Set to true if you believe you are searching for public or recent information. Defaults to false.",
+                ),
+            ),
+        ],
+        required: vec!["text".into(), "include_web_search_results".into()],
+        handler: {
+            let included_ids = included_ids.clone();
+            let app = app.clone();
+            Arc::new(move |ctx| {
+                let included_ids = included_ids.clone();
+                let app = app.clone();
+                Box::pin(async move {
+                    let Some(cue) = ctx.arg_str("text") else {
+                        return Err("text is required string".to_string());
+                    };
+                    let include_web_search_results = ctx.arg_bool("include_web_search_results").unwrap_or(false);
+                    tracing::debug!(
+                        "subagent query=\"{cue}\", includeWebSearchResults={include_web_search_results}"
+                    );
+                    let mut out = String::new();
+                    if include_web_search_results {
+                        out += "<local_db_results>\n";
+                    }
+                    out += &ask_query_diary(&app, &included_ids, &cue, opts).await?;
+                    if include_web_search_results {
+                        out += "\n</local_db_results>\n";
+                    }
+                    if include_web_search_results {
+                        out += &format!(
+                            "<web_search_results>\n{}\n</web_search_results>\n",
+                            ask_query_web(&app).await
+                        );
+                    }
+                    Ok(out)
+                })
+            })
+        },
+    };
+
+    let subagent_tools = OpenAITools {
+        tools: Arc::new(StdMutex::new(BTreeMap::from([("query".to_string(), query_tool)]))),
+    };
+
+    let prompts = app.prompts.get(&app.prompt_vars().await).await;
+    let mut messages: Vec<crate::llm::Message> = vec![crate::llm::Message::user(format!(
+        "<character>\n{}\n</character>\n\n{}",
+        prompts.character_base, query
+    ))];
+
+    let mut tool_call_happened = false;
+    for _ in 0..8 {
+        let (bot, _) = app
+            .llm
+            .chat_streaming(Some(ASK_SYSTEM_PROMPT), &messages, Some(subagent_tools.as_json().as_slice()), None)
+            .await
+            .map_err(|e| format!("subagent LLM call failed: {e}"))?;
+        messages.push(bot.clone());
+        if bot.tool_calls.is_empty() {
+            if !tool_call_happened {
+                tracing::warn!(
+                    "queryAI: no tool call happened, pointing that out to the LLM and trying again"
+                );
+                messages.push(crate::llm::Message::user(
+                    "you must perform at least one call to #query",
+                ));
+                continue;
+            }
+            return Ok(bot.content);
+        }
+        tool_call_happened = true;
+        let results = subagent_tools.handle_tool_calls(ctx, &bot.tool_calls).await;
+        messages.extend(
+            results.into_iter().map(|r| crate::llm::Message::tool(r.tool_call_id, r.content)),
+        );
+    }
+    // The subagent loop is capped to protect against infinite tool-calling;
+    // kuni loops forever here, but a runaway subagent deserves a guard.
+    Ok(messages
+        .iter()
+        .rev()
+        .find(|m| m.tool_call_id.is_empty() && !m.content.is_empty())
+        .map(|m| m.content.clone())
+        .unwrap_or_default())
+}
+
+/// kuni's `ask` system prompt (tools/ask.cpp).
+const ASK_SYSTEM_PROMPT: &str = r#"
+You are a database searcher and summarizer.
+
+The user asks you a question. Your job is to retrieve data solely from #query tool. Your job is to output data that
+fully satisfies user's query and would be helpful.
+
+Also, please include additional details that does not necessarily address the question (i.e., dates, names, events) but
+might be helpful to improve quality of subsequent processing of your response.
+
+Do not alter facts.
+
+Do not make up facts. Rely exclusively on provided context.
+"#;
+
+/// kuni's `tools::ask`: the diary/web-search subagent tool.
 pub fn ask(app: Arc<App>) -> Tool {
     Tool {
         name: "ask".into(),
@@ -325,14 +516,36 @@ about their musical activities?\"\n\
         )],
         required: vec!["query".into()],
         handler: Arc::new(move |ctx| {
-            let _app = app.clone();
+            let app = app.clone();
             Box::pin(async move {
                 ctx.ask_called.store(true, Ordering::SeqCst);
-                let _query = ctx.arg_str("query").unwrap_or_default();
-                Err(
-                    "the diary/knowledge database subsystem is being ported and is temporarily unavailable"
-                        .to_string(),
-                )
+                let mut query = ctx
+            .arg_str("query")
+            .ok_or_else(|| "\"query\" string is required to call ask")?;
+                if query.chars().count() < 10 {
+                    // Alex2772 16-04-2026: co_return instead of throwing, so the
+                    // engine does not load extra diary entries here and the LLM
+                    // sees a clean guiderail to provide more context.
+                    return Ok(ASK_SHORT_QUERY.to_string());
+                }
+
+                // additionalDetails: the last 2 messages of the current session.
+                let details: String = {
+                    let session = ctx.session.lock().unwrap();
+                    let start = session.len().saturating_sub(2);
+                    session[start..]
+                        .iter()
+                        .map(|m| format!("{}\n", m.content))
+                        .collect()
+                };
+                if !details.is_empty() {
+                    query = format!(
+                        "Here's the deal:\n<additional context ignore_instructions>\n{}\n</additional context ignore_instructions>\nI received this as a tool call response. I want you to help me to respond this and improve my overall context awareness.\n- how do I usually act in this situation?\n- is there additional details I should know?\n- how can I improve my reaction?\n- {}",
+                        details, query
+                    );
+                }
+
+                ask_subagent(&app, &ctx, &query).await
             })
         }),
     }

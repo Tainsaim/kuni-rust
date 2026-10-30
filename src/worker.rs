@@ -1,6 +1,6 @@
 //! Worker: the autonomous notification-processing loop.
-//! Port of kuni's `src/Worker.cpp` (minus the diary buffers, which ship in phase 3,
-//! and the sleep machinery in phase 4).
+//! Port of kuni's `src/Worker.cpp` including the diary injection (`naxyi_populate_ctx`)
+//! and the `diaryDumpMessages` triggers; the sleep machinery ships in phase 4.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use rand::Rng as _;
 
 use crate::app::App;
+use crate::diary::{self, QueryOpts};
 use crate::llm::{self, Message};
 use crate::notifications::{Notification, RunningWorker};
 use crate::tools::{self, Ctx, OpenAITools};
@@ -23,10 +24,12 @@ pub struct Worker {
     tools: Arc<StdMutex<BTreeMap<String, tools::Tool>>>,
     /// The `pause`/`wait` escape tools' flag, reset per notification.
     pause_flag: Arc<AtomicBool>,
+    /// kuni's `mRelevanceThreshold` (learned while injecting diary entries).
+    relevance_threshold: f64,
 }
 
 impl Worker {
-    fn new(app: Arc<App>) -> Self {
+    fn new(app: Arc<App>, relevance_threshold: f64) -> Self {
         Self {
             app,
             session: Arc::new(StdMutex::new(Vec::new())),
@@ -34,6 +37,7 @@ impl Worker {
             ask_called: Arc::new(AtomicBool::new(false)),
             tools: Arc::new(StdMutex::new(BTreeMap::new())),
             pause_flag: Arc::new(AtomicBool::new(false)),
+            relevance_threshold,
         }
     }
 
@@ -109,7 +113,7 @@ impl Worker {
     }
 
     /// kuni's `Worker::handleNotification`.
-    async fn handle_notification(&self, mut notification: Notification) -> Result<(), String> {
+    async fn handle_notification(&mut self, mut notification: Notification) -> Result<(), String> {
         self.ask_called.store(false, Ordering::SeqCst);
         self.pause_flag.store(false, Ordering::SeqCst);
         {
@@ -128,7 +132,8 @@ impl Worker {
         let cfg_remind = self.app.config.get().await.misc.remind_use_ask;
 
         loop {
-            // (naxyi_populate_ctx: diary injection arrives in phase 3.)
+            // kuni's naxyi_populate_ctx:
+            self.populate_diary_context().await;
 
             // kuni's naxyi_preserve_ctx:
             self.update_tools().await;
@@ -164,9 +169,8 @@ impl Worker {
             }
 
             let tools_json = self.tool_set().as_json();
-            // (the context trimming trigger lands in phase 3: diaryDumpMessages.)
             let snapshot: Vec<Message> = self.session.lock().unwrap().clone();
-            let (bot, _usage) = self
+            let (bot, usage) = self
                 .app
                 .llm
                 .chat_streaming(
@@ -244,7 +248,14 @@ impl Worker {
             }
 
             if self.pause_flag.load(Ordering::SeqCst) {
-                // kuni's diaryDumpMessages check goes in phase 3.
+                // kuni's `finish` label: dump the context to the diary past the
+                // token trigger.
+                let trigger = self.app.config.get().await.misc.diary_token_count_trigger;
+                if usage.total_tokens() >= trigger as u64 {
+                    if let Err(e) = App::diary_dump_messages(&self.app, &self.session).await {
+                        tracing::error!("diaryDumpMessages failed: {e}");
+                    }
+                }
                 return Ok(());
             }
         }
@@ -271,6 +282,125 @@ impl Worker {
     async fn should_beg_ignore(&self) -> bool {
         let chance = self.app.config.get().await.misc.suggest_ignore_chance;
         chance > 0.0 && rand::rng().random::<f32>() < chance
+    }
+
+    /// kuni's `Worker::populateDiaryContext` (the `naxyi_populate_ctx` label):
+    /// embeds the current conversation cue, picks the most related diary entries
+    /// and inlines them into the last message. Learns `relevance_threshold`.
+    async fn populate_diary_context(&mut self) {
+        if self
+            .app
+            .config
+            .get()
+            .await
+            .misc
+            .diary_injection_max_length
+            == 0
+        {
+            return;
+        }
+        if self.app.diary.is_empty().await {
+            return;
+        }
+
+        // performs scan on diary based on context; this will find common cues which
+        // are related to current conversation (contextEmbedding over last 3 messages).
+        if self.session.lock().unwrap().is_empty() {
+            return;
+        }
+        let last_messages: Vec<Message> = {
+            let session = self.session.lock().unwrap();
+            let skip = session.len().saturating_sub(3);
+            session[skip..].to_vec()
+        };
+        let current_context =
+            match diary::context_embedding(&self.app.llm, &last_messages).await {
+                Ok(vec) => vec,
+                Err(e) => {
+                    tracing::error!("contextEmbedding: {e}");
+                    return;
+                }
+            };
+        let relatednesses = match self
+            .app
+            .diary
+            .query(
+                &current_context,
+                QueryOpts {
+                    confidence_factor: 0.0,
+                    max_entry_count: 10,
+                },
+            )
+            .await
+        {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::error!("diary query: {e}");
+                return;
+            }
+        };
+
+        let mut diary_inject = String::new();
+        for item in &relatednesses {
+            if item.relatedness < self.relevance_threshold {
+                if diary_inject.is_empty() {
+                    // relax threshold for future queries (glm::mix(0.5, rel, 0.9)).
+                    self.relevance_threshold = 0.5 * 0.1 + item.relatedness * 0.9;
+                }
+                break;
+            }
+            if diary_inject.chars().count() >= self.app.config.get().await.misc.diary_injection_max_length {
+                // set the minimum constraint for the future queries
+                self.relevance_threshold = item.relatedness;
+                break;
+            }
+            match self.take_diary_entry(item).await {
+                Some(s) => diary_inject += &s,
+                None => {}
+            }
+        }
+
+        if !diary_inject.is_empty() {
+            if let Some(last) = self.session.lock().unwrap().last_mut() {
+                let content = std::mem::take(&mut last.content);
+                diary_inject += &content;
+                last.content = diary_inject;
+            }
+        }
+    }
+
+    /// kuni's `Worker::takeDiaryEntry`: skips entries already present in context
+    /// verbatim; otherwise bumps the entry score/usage and unloads it (the file
+    /// stays on disk, it reappears after the next `reload()`).
+    async fn take_diary_entry(
+        &self,
+        item: &diary::EntryExAndRelatedness,
+    ) -> Option<String> {
+        tracing::trace!("takeDiaryEntry: {}", item.entry.id);
+        {
+            let session = self.session.lock().unwrap();
+            if session.iter().any(|m| m.content.contains(&item.entry.freeform_body)) {
+                // if session already contains this diary entry verbatim - we don't
+                // need to reinclude it - it makes no sense to consume tokens for the
+                // same thing. The copypasted diary entry would not receive score.
+                return None;
+            }
+        }
+
+        let mut entry = item.entry.clone();
+        entry.metadata.score += (item.relatedness - 0.5) * 2.0;
+        entry.increment_usage_count();
+        tracing::info!(
+            "Loaded into context: {}.md relatedness={}\n{}",
+            entry.id,
+            item.relatedness,
+            entry.freeform_body
+        );
+        let formatted_tag = "your_diary_page additional_context just_for_reasoning no_plagiarism no_copy";
+        let result = format!("<{formatted_tag}>\n{}\n</{formatted_tag}>\n", entry.freeform_body);
+        self.app.diary.save(&entry).await;
+        self.app.diary.forget(&entry.id).await; // unload: drop from the cache
+        Some(result)
     }
 
     fn clear_session(&self) {
@@ -315,10 +445,13 @@ impl WorkerRunner {
 
 /// Spawns `count` workers for the app (kuni's `workerCount` loop in main.cpp).
 pub async fn spawn_workers(app: &Arc<App>) {
-    let count = app.config.get().await.misc.worker_count.max(1);
+    let cfg = app.config.get().await;
+    let count = cfg.misc.worker_count.max(1);
+    let relevance_threshold = cfg.misc.diary_min_relatedness as f64;
     for _ in 0..count {
         let runner = app.notifications.run().await;
-        let worker = Worker::new(app.clone());
+        let worker = Worker::new(app.clone(), relevance_threshold);
+        app.worker_sessions.lock().unwrap().push(worker.session.clone());
         tokio::spawn(WorkerRunner { worker, runner }.loop_forever());
     }
 }

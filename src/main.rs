@@ -3,6 +3,7 @@
 
 mod app;
 mod config;
+mod diary;
 mod llm;
 mod llmui;
 mod notifications;
@@ -10,6 +11,8 @@ mod prompts;
 mod tools;
 mod tg;
 mod worker;
+
+use crate::app::App;
 
 use anyhow::Result;
 use grammers_client::Client;
@@ -56,6 +59,11 @@ async fn main() -> Result<()> {
     let prompts = prompts::PromptStore::bootstrap(std::path::Path::new("prompts")).await?;
     let notifications =
         std::sync::Arc::new(notifications::NotificationManager::new());
+    let diary = std::sync::Arc::new(diary::Diary::new(
+        std::path::Path::new(app::WORK_DIR).join("diary"),
+        std::sync::Arc::new(llm.clone()),
+        config.clone(),
+    ));
     let app = std::sync::Arc::new(app::App::new(
         config.clone(),
         tg.clone(),
@@ -63,6 +71,7 @@ async fn main() -> Result<()> {
         llm,
         prompts,
         notifications,
+        diary,
     ));
     app::init(&app).await?;
     app.refresh_config().await;
@@ -91,6 +100,13 @@ async fn main() -> Result<()> {
 
     println!("Shutting down...");
     tg.set_online(false).await.ok();
+    // kuni's shutdown: `async << app->diaryDumpMessages()` — dump every worker's
+    // session into the diary before exiting.
+    for session in app.worker_sessions.lock().unwrap().iter().cloned().collect::<Vec<_>>() {
+        if let Err(e) = App::diary_dump_messages(&app, &session).await {
+            tracing::error!("shutdown diaryDumpMessages failed: {e}");
+        }
+    }
     stream.sync_update_state().await.ok();
     handle.quit();
     let _ = pool_task.await;

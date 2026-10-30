@@ -16,6 +16,8 @@ const DEFAULT_CHARACTER_BASE: &str = include_str!("../prompts/character_base.md"
 const DEFAULT_CHARACTER_APPEARANCE: &str = include_str!("../prompts/character_appearance.md");
 const DEFAULT_EPILOGUE: &str = include_str!("../prompts/messages_epilogue.md");
 const DEFAULT_ANTI_REPEAT: &str = include_str!("../prompts/anti_repeat.md");
+const DEFAULT_DIARY_SAVE: &str = include_str!("../prompts/diary_save.md");
+const DEFAULT_SLEEP_CONSOLIDATOR: &str = include_str!("../prompts/sleep_consolidator.md");
 
 const RELOAD_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -27,6 +29,11 @@ pub struct RawPrompts {
     pub messages_epilogue: String,
     /// Shown to the LLM when it sends a repeated message (`prompts().antiRepeatPrompt`).
     pub anti_repeat: String,
+    /// Appended as a USER message when the context is being dumped into the diary
+    /// (`prompts().diarySave`).
+    pub diary_save: String,
+    /// System prompt of the sleep-time consolidation pass (`prompts().sleepConsolidator`).
+    pub sleep_consolidator: String,
 }
 
 /// Rendered prompts with the variables substituted (kuni's `Prompts` after `promptPrintf`).
@@ -37,6 +44,8 @@ pub struct Prompts {
     pub character_appearance: String,
     pub messages_epilogue: String,
     pub anti_repeat: String,
+    pub diary_save: String,
+    pub sleep_consolidator: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -66,6 +75,8 @@ impl PromptStore {
         Self::seed_once(&dir, "character_appearance.md", DEFAULT_CHARACTER_APPEARANCE).await?;
         Self::seed_once(&dir, "messages_epilogue.md", DEFAULT_EPILOGUE).await?;
         Self::seed_once(&dir, "anti_repeat.md", DEFAULT_ANTI_REPEAT).await?;
+        Self::seed_once(&dir, "diary_save.md", DEFAULT_DIARY_SAVE).await?;
+        Self::seed_once(&dir, "sleep_consolidator.md", DEFAULT_SLEEP_CONSOLIDATOR).await?;
 
         let raw = Self::load_all(&dir).await?;
         let store = Arc::new(Self {
@@ -131,11 +142,19 @@ impl PromptStore {
         let epilogue_raw =
             read_file("messages_epilogue.md").await.unwrap_or_else(|| DEFAULT_EPILOGUE.to_string());
         let anti_raw = read_file("anti_repeat.md").await;
+        let diary_save_raw = read_file("diary_save.md")
+            .await
+            .unwrap_or_else(|| DEFAULT_DIARY_SAVE.to_string());
+        let sleep_consolidator_raw = read_file("sleep_consolidator.md")
+            .await
+            .unwrap_or_else(|| DEFAULT_SLEEP_CONSOLIDATOR.to_string());
         Ok(RawPrompts {
             system: Self::strip_header(&system_raw).to_string(),
             character_base: Self::strip_header(&base_raw).to_string(),
             character_appearance: Self::strip_header(&appearance_raw).to_string(),
             messages_epilogue: Self::strip_header(&epilogue_raw).to_string(),
+            diary_save: Self::strip_header(&diary_save_raw).to_string(),
+            sleep_consolidator: Self::strip_header(&sleep_consolidator_raw).to_string(),
             anti_repeat: anti_raw
                 .as_deref()
                 .map(Self::strip_header)
@@ -154,6 +173,8 @@ impl PromptStore {
             character_appearance: Self::substitute(&raw.character_appearance, vars),
             messages_epilogue: Self::substitute(&raw.messages_epilogue, vars),
             anti_repeat: Self::substitute(&raw.anti_repeat, vars),
+            diary_save: Self::substitute(&raw.diary_save, vars),
+            sleep_consolidator: Self::substitute(&raw.sleep_consolidator, vars),
         }
     }
 
@@ -222,6 +243,8 @@ mod tests {
         assert!(DEFAULT_EPILOGUE.contains("reject playfully"));
         assert!(DEFAULT_CHARACTER_BASE.contains("When asked for your name"));
         assert!(DEFAULT_CHARACTER_APPEARANCE.contains("${CHARACTER_NAME}"));
+        assert!(DEFAULT_DIARY_SAVE.contains("outputFormatting"));
+        assert!(DEFAULT_SLEEP_CONSOLIDATOR.contains("Sleep-time Consolidator"));
         // Stripped body has no leftover header.
         assert!(!PromptStore::strip_header(DEFAULT_SYSTEM).starts_with("---"));
         assert!(!PromptStore::strip_header(DEFAULT_CHARACTER_BASE).starts_with("---"));

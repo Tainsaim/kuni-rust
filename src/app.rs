@@ -5,19 +5,28 @@
 //! Event-flow functions are free-standing and take `Arc<App>` explicitly, because
 //! notification/tool handlers capture an owned `Arc<App>`.
 
+use std::path::PathBuf;
 use std::sync::atomic::AtomicU32;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use grammers_client::peer::Peer;
 use grammers_client::update::Update;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
 use crate::config::{ConfigHub, LockdownMode};
+use crate::diary::Diary;
 use crate::llm::Llm;
 use crate::llmui;
 use crate::notifications::{Notification, NotificationManager};
 use crate::prompts::{PromptStore, PromptVars};
 use crate::tg::Tg;
 use crate::tools::{self, Ctx};
+
+/// kuni's `AppBase::WORKING_MEMORY_PATH` (relative to the working dir).
+const WORKING_MEMORY_PATH: &str = "working_memory.md";
+/// kuni's working dir: everything persistent lives here (`main.cpp:769` diary,
+/// `AppBase` working memory).
+pub const WORK_DIR: &str = "data";
 
 /// The kind of a chat: determines the available tools and instructions
 /// (kuni's chatType switch in `llmuiOpenTelegramChat`).
@@ -64,6 +73,15 @@ pub struct App {
     /// Dialog id of the chat the LLM currently generates a reply in
     /// (kuni's `mCurrentlyOpenedChat`, used by the typing indicator); 0 = none.
     pub currently_opened_chat: std::sync::atomic::AtomicI64,
+    /// The long-term memory (kuni's `mDiary`).
+    pub diary: Arc<Diary>,
+    /// kuni's `mWorkingMemoryLock`: serializes diary dump flows.
+    working_memory_lock: AsyncMutex<()>,
+    /// kuni's `mSystemPromptSuffix` (`onCleanContext` output), reset by dumps;
+    /// `None` == recompute needed.
+    system_prompt_suffix: RwLock<Option<String>>,
+    /// Registered worker sessions for the shutdown dump (kuni's `mWorkers`).
+    pub worker_sessions: StdMutex<Vec<Arc<StdMutex<Vec<crate::llm::Message>>>>>,
 }
 
 impl App {
@@ -74,6 +92,7 @@ impl App {
         llm: Llm,
         prompts: Arc<PromptStore>,
         notifications: Arc<NotificationManager>,
+        diary: Arc<Diary>,
     ) -> Self {
         Self {
             config,
@@ -82,8 +101,16 @@ impl App {
             llm,
             prompts,
             notifications,
+            diary,
             currently_opened_chat: std::sync::atomic::AtomicI64::new(0),
+            working_memory_lock: AsyncMutex::new(()),
+            system_prompt_suffix: RwLock::new(None),
+            worker_sessions: StdMutex::new(Vec::new()),
         }
+    }
+
+    pub fn working_memory_path(&self) -> PathBuf {
+        std::path::Path::new(WORK_DIR).join(WORKING_MEMORY_PATH)
     }
 
     /// The prompt variable substitutions for this configuration
@@ -97,20 +124,144 @@ impl App {
         }
     }
 
-    /// kuni's `AppBase::getSystemPrompt`: system + character base + appearance
-    /// (+ working-memory suffix in phase 3) + the lockdown note.
+    /// kuni's `AppBase::getSystemPrompt`: system + character base + appearance + the
+    /// cached working-memory suffix + the lockdown note.
     pub async fn get_system_prompt(&self) -> String {
         let config = self.config.get().await;
         let prompts = self.prompts.get(&self.prompt_vars().await).await;
+        let mut suffix = self.system_prompt_suffix.write().await;
+        if suffix.is_none() {
+            *suffix = Some(self.on_clean_context().await);
+        }
         let mut prompt = format!(
-            "{}\n\n{}\n\n<your_appearance>\n{}\n</your_appearance>\n",
-            prompts.system, prompts.character_base, prompts.character_appearance
+            "{}\n\n{}\n\n<your_appearance>\n{}\n</your_appearance>\n{}",
+            prompts.system,
+            prompts.character_base,
+            prompts.character_appearance,
+            suffix.clone().unwrap_or_default()
         );
+        drop(suffix);
         if config.general.lockdown != LockdownMode::None {
             prompt +=
                 "\nYou are currently under lockdown mode. This means you can access to subset of chats only.";
         }
         prompt
+    }
+
+    /// kuni's `AppBase::onCleanContext`: the `<things_to_remember>` suffix injected
+    /// into the system prompt until the next diary dump.
+    async fn on_clean_context(&self) -> String {
+        let Ok(working_memory) = tokio::fs::read_to_string(self.working_memory_path()).await
+        else {
+            return String::new();
+        };
+        format!(
+            r#"<things_to_remember>
+{}
+</things_to_remember>
+<instructions>
+Your behaviour must be highly influenced by "physical state" and "emotional state" mentioned above.
+
+<example>
+Emotional state: anger
+...
+send_telegram_message("text":"иди нахуй заебал")
+</example>
+<example>
+Emotional state: amused
+...
+send_telegram_message("text":"мррр~")
+</example>
+</instruction>
+"#,
+            working_memory
+        )
+    }
+
+    // ===================================================================
+    // Diary (phase 3): context dump (AppBase::diaryDumpMessages).
+    // ===================================================================
+
+    /// kuni's `AppBase::diaryDumpMessages`: distills the session into diary entries
+    /// + the working memory file, then clears the context and the prompt suffix.
+    /// Diar reload runs on every path (kuni's `AUI_DEFER`).
+    pub async fn diary_dump_messages(
+        app: &Arc<App>,
+        session: &Arc<StdMutex<Vec<crate::llm::Message>>>,
+    ) -> Result<(), String> {
+        let result = diary_dump_impl(app, session).await;
+        app.diary.reload().await;
+        result
+    }
+
+    async fn diary_summary(
+        app: &Arc<App>,
+        mut context: Vec<crate::llm::Message>,
+    ) -> Result<Vec<crate::diary::EntryEx>, String> {
+        let prompts = app.prompts.get(&app.prompt_vars().await).await;
+        let system_prompt = app.get_system_prompt().await;
+        context.push(crate::llm::Message::user(prompts.diary_save));
+        loop {
+            let (message, _) = app
+                .llm
+                .chat_streaming(Some(&system_prompt), &context, None, None)
+                .await
+                .map_err(|e| format!("diary summary LLM call failed: {e}"))?;
+            if message.content.is_empty() {
+                context.push(message);
+                context.push(crate::llm::Message::user(
+                    "Tools are not available; write the summary without tools.",
+                ));
+                continue;
+            }
+            return app.diary.diary_save_entries(&message.content).await;
+        }
+    }
+
+    /// kuni's `util::importantThingsToRemember` chat pump.
+    async fn important_things_to_remember(
+        app: &Arc<App>,
+        context: &[crate::llm::Message],
+        previous_working_memory: &str,
+    ) -> Result<String, String> {
+        let name = app
+            .config
+            .get()
+            .await
+            .general
+            .character_name
+            .clone();
+        let prompt = crate::diary::important_things_to_remember_prompt(&name, previous_working_memory);
+        let mut messages = context.to_vec();
+        messages.push(crate::llm::Message::user(prompt));
+
+        let mut shit_check_triggered = false;
+        loop {
+            let system_prompt = app.get_system_prompt().await;
+            let (message, _) = app
+                .llm
+                .chat_streaming(Some(&system_prompt), &messages, None, None)
+                .await
+                .map_err(|e| format!("working memory LLM call failed: {e}"))?;
+            let mut content = message.content;
+            if content.contains("tool_calls") || content.contains("ask") {
+                // deepseek bug - attempts to use DSML to make a tool call.
+                if !shit_check_triggered {
+                    shit_check_triggered = true;
+                    continue;
+                }
+            }
+            // sometimes llm wraps with xml tags by itself, we don't need that
+            content = content
+                .replace("<things_to_remember>", "")
+                .replace("</things_to_remember>", "");
+            let content = content.trim_start_matches(|c: char| c != '\n' && c.is_whitespace());
+            if content.is_empty() {
+                // sometimes llm returns blank response - try again
+                continue;
+            }
+            return Ok(content.to_string());
+        }
     }
 
     /// Applies dynamic (hot-reloaded) config knobs to live structures.
@@ -496,4 +647,52 @@ pub async fn open_telegram_chat(app: &Arc<App>, ctx: &Ctx, chat_id: i64) -> Resu
 
 fn err_display(e: impl std::fmt::Display) -> String {
     e.to_string()
+}
+
+/// The body of `diary_dump_messages` (the `AUI_DEFER` reload is handled by the
+/// caller).
+async fn diary_dump_impl(
+    app: &Arc<App>,
+    session: &Arc<StdMutex<Vec<crate::llm::Message>>>,
+) -> Result<(), String> {
+    // kuni's try_lock loop over mWorkingMemoryLock.
+    let lock = app.working_memory_lock.clone();
+    let _guard = loop {
+        if let Some(guard) = lock.try_lock() {
+            break guard;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    };
+
+    if session.lock().unwrap().is_empty() {
+        return Ok(());
+    }
+
+    let previous_working_memory = tokio::fs::read_to_string(app.working_memory_path())
+        .await
+        .unwrap_or_default();
+
+    // kuni launches the "important things" future before the diary summary so the
+    // two LLM chats run concurrently; only the result is awaited afterwards.
+    let important = {
+        let app2 = app.clone();
+        let context = session.lock().unwrap().clone();
+        tokio::spawn(async move {
+            App::important_things_to_remember(&app2, &context, &previous_working_memory).await
+        })
+    };
+
+    let context = session.lock().unwrap().clone();
+    App::diary_summary(app, context).await?;
+
+    let working_memory_md = important
+        .await
+        .map_err(|e| format!("working memory LLM task failed: {e}"))??;
+    tokio::fs::write(app.working_memory_path(), working_memory_md)
+        .await
+        .map_err(|e| format!("failed to write {}: {e}", app.working_memory_path().display()))?;
+
+    session.lock().unwrap().clear();
+    *app.system_prompt_suffix.write().await = None;
+    Ok(())
 }

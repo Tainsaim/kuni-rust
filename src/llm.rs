@@ -150,6 +150,7 @@ impl Usage {
 // ---------------------------------------------------------------------------
 
 /// Virtual endpoints set (kuni's `LLMEndpoint*`).
+#[derive(Clone)]
 pub struct Llm {
     http: reqwest::Client,
     pub config: Arc<ConfigHub>,
