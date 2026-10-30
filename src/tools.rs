@@ -224,10 +224,14 @@ impl OpenAITools {
         calls: &[ToolCall],
     ) -> Vec<ToolResult> {
         let mut out = Vec::new();
-        let guard = self.tools.lock().unwrap();
         for call in calls {
-            let content = match guard.get(&call.name) {
-                Some(tool) => {
+            // Don't hold the tool-set lock across the await (MutexGuard is !Send).
+            let handler = {
+                let guard = self.tools.lock().unwrap();
+                guard.get(&call.name).map(|tool| tool.handler.clone())
+            };
+            let content = match handler {
+                Some(handler) => {
                     let ctx = Ctx {
                         app: ctx.app.clone(),
                         args: call.arguments.clone(),
@@ -237,7 +241,7 @@ impl OpenAITools {
                         seen: ctx.seen.clone(),
                         session: ctx.session.clone(),
                     };
-                    (tool.handler)(ctx).await
+                    (handler)(ctx).await
                 }
                 None => Ok(format!(
                     "tool \"{}\" is not currently available. Please use another tool instead.",
@@ -1068,23 +1072,23 @@ async fn anti_repeat(app: &App, opened: &OpenedChat, message: &str) -> Result<()
     }
 
     let mut praises = Vec::with_capacity(own.len());
-    {
-        let mut cache = app.tg.anti_repeat_cache.lock().unwrap();
-        for m in own.iter() {
-            let text = m.text();
-            let embedding = match cache.get(text) {
-                Some(e) => e.clone(),
-                None => {
-                    let e = app.llm.embed(text).await.map_err(err_display)?;
-                    if cache.len() >= cfg.misc.anti_repeat_max_history {
-                        cache.clear();
-                    }
-                    cache.insert(text.to_string(), e);
-                    cache.get(text).unwrap().clone()
+    for m in own.iter() {
+        let text = m.text();
+        // Don't hold the cache lock across the embed() await (MutexGuard is !Send).
+        let cached = app.tg.anti_repeat_cache.lock().unwrap().get(text).cloned();
+        let embedding = match cached {
+            Some(e) => e,
+            None => {
+                let e = app.llm.embed(text).await.map_err(err_display)?;
+                let mut cache = app.tg.anti_repeat_cache.lock().unwrap();
+                if cache.len() >= cfg.misc.anti_repeat_max_history {
+                    cache.clear();
                 }
-            };
-            praises.push(crate::tg::human::cosine_similarity(&target, &embedding));
-        }
+                cache.entry(text.to_string()).or_insert(e.clone());
+                e
+            }
+        };
+        praises.push(crate::tg::human::cosine_similarity(&target, &embedding));
     }
     let max_similarity = praises
         .iter()
