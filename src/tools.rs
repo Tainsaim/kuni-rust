@@ -552,8 +552,15 @@ about their musical activities?\"\n\
     }
 }
 
-/// pause/wait of kuni's Worker.cpp escape handler.
-pub fn escape_tool(name: &'static str, description: &str, pause_flag: Arc<AtomicBool>) -> Tool {
+/// pause/wait of kuni's Worker.cpp escape handler. `nudge` carries the app + the
+/// acting-proactively flag: when Kuni is processing an actProactively-generated
+/// notification, a wait lets her "try to write someone else, still".
+pub fn escape_tool(
+    name: &'static str,
+    description: &str,
+    pause_flag: Arc<AtomicBool>,
+    nudge: Option<(Arc<App>, Arc<AtomicBool>)>,
+) -> Tool {
     Tool {
         name: name.into(),
         description: description.into(),
@@ -561,8 +568,29 @@ pub fn escape_tool(name: &'static str, description: &str, pause_flag: Arc<Atomic
         required: vec![],
         handler: Arc::new(move |_ctx| {
             let pause_flag = pause_flag.clone();
+            let nudge = nudge.clone();
             Box::pin(async move {
                 pause_flag.store(true, Ordering::SeqCst);
+                if let Some((app, acting)) = nudge {
+                    // at the end of "actProactively", let's try to encourage LLM to
+                    // write someone, still. If the LLM hasn't written to anyone at
+                    // this point, this notification will guide the LLM that a
+                    // dismissive action is not acceptable and the LLM will try to
+                    // revisit some older dialog despite no cue. If the LLM actually
+                    // has written to someone at this point, the LLM will initiate a
+                    // dialog with one more person.
+                    if acting.load(Ordering::SeqCst) {
+                        app.notifications
+                            .pass_notification(crate::notifications::Notification {
+                                message: "You should write someone else and be more proactive."
+                                    .to_string(),
+                                actions: OpenAITools::default(),
+                                priority: 0,
+                                pin: Some(crate::app::PROACTIVE_PIN.to_string()),
+                            })
+                            .await;
+                    }
+                }
                 Ok("Success".to_string())
             })
         }),

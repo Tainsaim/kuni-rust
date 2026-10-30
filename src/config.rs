@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 use notify::Watcher as _;
 use tokio::sync::{watch, RwLock};
 
+/// kuni's `Config::SLEEP_MAX_TIME` (`std::chrono::hours(6)`): the hard cap of the
+/// sleeping diary consolidation.
+pub const SLEEP_MAX_TIME: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
 /// Mirrors kuni's `Config::LockdownMode`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

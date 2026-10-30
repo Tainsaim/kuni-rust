@@ -11,9 +11,11 @@
 //! `util/diary_save_entries.h` / `util/important_things_to_remember.h`.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rand::{rng, Rng as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard};
 
@@ -134,6 +136,11 @@ impl Diary {
     }
 
     /// Cached entries (kuni's `Diary::list`).
+    pub async fn list(&self) -> Vec<EntryEx> {
+        self.cache_loaded().await.as_ref().unwrap().clone()
+    }
+
+    /// Whether the diary has no entries (uses the same cache as `list`).
     pub async fn is_empty(&self) -> bool {
         self.cache_loaded().await.as_ref().unwrap().is_empty()
     }
@@ -353,39 +360,278 @@ impl Diary {
         }
         Ok(result)
     }
+
+    // =====================================================================
+    // kuni's Diary::sleepingConsolidation (phase 4)
+    // =====================================================================
+
+    /// kuni's `Diary::sleepingConsolidation`: emulates human sleeping behavior
+    /// against the diary. `sleeping_consolidator_prompt` is
+    /// `prompts().sleepConsolidator`; `deadline` bounds this invocation with the
+    /// current sleep window; `abort` is the wake-up flag (checked between steps).
+    ///
+    /// Note: kuni-master triggers this only from the tests/debug UI; kuni-rs runs
+    /// it during the random go-sleep window instead
+    /// (`Worker::process_randomly_go_sleep`).
+    pub async fn sleeping_consolidation(
+        &self,
+        sleeping_consolidator_prompt: &str,
+        deadline: Option<std::time::Instant>,
+        abort: Option<Arc<AtomicBool>>,
+    ) {
+        // We reached sleep max time. How many memory pieces did we cover? This
+        // depends on the LLM's processing speed: both cloud deepseek-chat and
+        // (qwen3.5:9b on an RTX4090) can process about 500 of Kuni's diary entries
+        // per hour. Anyway, we don't need to process all entries, neither the
+        // human brain does. This also means our algorithm does not require memory
+        // decay (i.e., deleting old irrelevant entries): Kuni will remember
+        // everything, but they would not spend LLM processing power on reflecting
+        // about the same shit every time. There's a small chance Kuni will
+        // remember old stuff, see the random target pick.
+        let cancelled = |sleep_start: std::time::Instant,
+                         deadline: Option<std::time::Instant>,
+                         abort: &Option<Arc<AtomicBool>>| {
+            if sleep_start.elapsed() >= crate::config::SLEEP_MAX_TIME {
+                return true;
+            }
+            if let Some(deadline) = deadline {
+                if std::time::Instant::now() >= deadline {
+                    return true;
+                }
+            }
+            if let Some(abort) = abort {
+                if abort.load(std::sync::atomic::Ordering::SeqCst) {
+                    return true;
+                }
+            }
+            false
+        };
+
+        'outer: for _ in 0..CONSOLIDATION_MAX_ROUNDS {
+            // Fresh parse of the diary, sorted by id descending: recent first, old
+            // last. Kuni assigns the same list into mCachedDiary.
+            {
+                let mut entries = Self::parse(Self::read(&self.dir).await);
+                entries.sort_by(|a, b| b.id.cmp(&a.id));
+                *self.cache.lock().await = Some(entries);
+            }
+
+            let mut id = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|t| t.as_secs() as i64)
+                .unwrap_or(0);
+            let count = self.cache_loaded().await.as_ref().unwrap().len();
+            let sleep_start = std::time::Instant::now();
+
+            while !self.cache_loaded().await.as_ref().unwrap().is_empty() {
+                // we'll remove considered diary entries from the cache and save
+                // them back to disk.
+                if cancelled(sleep_start, deadline, &abort) {
+                    break 'outer;
+                }
+
+                let target = {
+                    let mut cache = self.cache_loaded().await;
+                    let entries = cache.as_mut().unwrap();
+                    if entries.is_empty() {
+                        break;
+                    }
+                    let idx = if rng().random::<f64>() < 0.8 {
+                        // Likely branch: during your sleep it's likely you see the
+                        // past couple of days. We will pick up the most recent
+                        // target. Also, the LLM really likes to write new entries
+                        // that mostly duplicate contents of those that were loaded
+                        // into its context via RAG from context's embedding; AFAIK
+                        // new details or reflections were added. Maybe it's not a
+                        // bad thing; considering the fact that below we will find
+                        // related entries as well and mix them together.
+                        0
+                    } else {
+                        // Unlikely branch: pick a random target. In perspective,
+                        // this gives more shuffled chunks, so each sleep
+                        // consolidation slightly different chunks are compared.
+                        // This gives uniform distribution of information and
+                        // merging/splitting behavior.
+                        rng().random_range(0..entries.len())
+                    };
+                    entries.remove(idx)
+                };
+
+                let mut target = target;
+                if target.metadata.embedding.is_empty() {
+                    match self.llm.embed(&target.freeform_body).await {
+                        Ok(vec) => target.metadata.embedding = vec,
+                        Err(e) => {
+                            tracing::error!("sleepingConsolidation can't embed {}: {e}", target.id);
+                            break 'outer;
+                        }
+                    }
+                }
+
+                // (The query may race with the workers: kuni is single-threaded
+                // here; a duplicate take just wastes a couple of LLM tokens.)
+                let results = loop {
+                    match self
+                        .query(
+                            &target.metadata.embedding,
+                            QueryOpts {
+                                confidence_factor: 0.0, // we need just embedding relatedness
+                                max_entry_count: 10,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(r) => break r,
+                        Err(e) => {
+                            // kuni's `goto tryAgain`; we add a pause to the retry
+                            // (kuni busy-retries, we can't afford the spin).
+                            tracing::error!("sleepingConsolidation can't query {e}");
+                            tokio::time::sleep(std::time::Duration::from_secs(RETRY_PAUSE_SECS)).await;
+                        }
+                    }
+                };
+
+                let mut ids: Vec<String> = vec![target.id.clone()];
+                let mut ids_to_remove: Vec<String> = Vec::new();
+                let mut body = String::new();
+                let trigger = self.config.get().await.misc.diary_token_count_trigger;
+                for (i, item) in results.iter().enumerate() {
+                    if body.chars().count() > trigger && i >= 2 {
+                        break;
+                    }
+                    if !body.is_empty() {
+                        body += "\n\n---\n\n";
+                    }
+                    body += &format!("{{\"confidence\":{}}}", item.entry.metadata.confidence);
+                    body += &item.entry.freeform_body;
+                    body += "\n";
+                    ids.push(item.entry.id.clone());
+                    if item.entry.metadata.confidence < 0.9999999 {
+                        ids_to_remove.push(item.entry.id.clone());
+                    }
+                    self.forget(&item.entry.id).await;
+                }
+                tracing::info!(
+                    "[{}/{}] sleepingConsolidation: [{}]",
+                    count - self.cache_loaded().await.as_ref().unwrap().len(),
+                    count,
+                    ids.join(", ")
+                );
+                tracing::debug!("sleepingConsolidation prompt: {body}");
+
+                // kuni label `naxyi`: send the consolidator body and parse the
+                // response; any LLM/parse error re-generates the whole chunk. The
+                // parse cap protects against a pathological LLM burning tokens
+                // forever (kuni retries indefinitely).
+                let mut parse_attempts = 0u32;
+                'naxyi: loop {
+                    let messages = [crate::llm::Message::user(body.clone())];
+                    let response = loop {
+                        match self
+                            .llm
+                            .chat_streaming(Some(sleeping_consolidator_prompt), &messages, None, None)
+                            .await
+                        {
+                            Ok((message, _)) => {
+                                tracing::debug!(
+                                    "sleepingConsolidation response: {}",
+                                    message.content
+                                );
+                                break message.content;
+                            }
+                            Err(e) => {
+                                tracing::error!("sleepingConsolidation can't chat {e}");
+                                tokio::time::sleep(std::time::Duration::from_secs(RETRY_PAUSE_SECS))
+                                    .await;
+                            }
+                        }
+                    };
+
+                    match self.parse_sleeping_response(&response, &mut id).await {
+                        Ok(()) => break,
+                        Err(e) => {
+                            tracing::error!("sleepingConsolidation can't parse: {e}");
+                            parse_attempts += 1;
+                            if parse_attempts >= MAX_PARSE_ATTEMPTS {
+                                break 'outer;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(RETRY_PAUSE_SECS)).await;
+                            continue 'naxyi;
+                        }
+                    }
+                }
+
+                // since we have written refined diary entries, we don't need the
+                // old ones.
+                for id_to_remove in &ids_to_remove {
+                    let file = self.dir.join(format!("{id_to_remove}.md"));
+                    match tokio::fs::remove_file(&file).await {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => tracing::error!(
+                            "sleepingConsolidation can't remove {}: {e}",
+                            file.display()
+                        ),
+                    }
+                }
+            }
+        }
+        self.reload().await;
+    }
+
+    /// kuni's response split: `{"confidence":x}body` pieces separated by `\n---`.
+    /// Saves the parsed pieces as it goes (kuni does the same, so a later parse
+    /// failure leaves the already-parsed pieces saved and re-generates the rest).
+    async fn parse_sleeping_response(&self, response: &str, next_id: &mut i64) -> Result<(), String> {
+        for piece in response.split("\n---") {
+            if piece.chars().count() < 10 {
+                continue; // unknown shit
+            }
+            let Some(brace) = piece.find('}') else {
+                return Err("no metadata block found".to_string());
+            };
+            #[derive(serde::Deserialize)]
+            struct SleepMeta {
+                confidence: f32,
+            }
+            let meta: SleepMeta =
+                serde_json::from_str(&piece[..=brace]).map_err(|e| format!("metadata parse: {e}"))?;
+            let freeform_body = piece[brace + 1..].trim_matches('\n');
+
+            if meta.confidence < -0.99999 {
+                // drop.
+                continue;
+            }
+
+            // IMPORTANT CONSIDERATION: we'll delete old entries, replacing them
+            // with the newer ones. This will effectively update their ids, thus,
+            // during the next sleep, they will appear again closer to the
+            // beginning of the processing queue. This algorithm encourages keeping
+            // in mind the most recent events and reflecting on them specifically.
+            self.save(&EntryEx {
+                id: next_id.to_string(),
+                metadata: Metadata {
+                    confidence: meta.confidence.clamp(-0.99, 0.99),
+                    ..Default::default()
+                },
+                freeform_body: freeform_body.to_string(),
+            })
+            .await;
+            *next_id += 1;
+        }
+        Ok(())
+    }
 }
 
-/// kuni's `Diary::parse` lambda: extracts the `---json---` prologue; falls back to
-/// the whole (trimmed) text with default metadata on failure.
-fn parse_one(id: &str, text: &str) -> EntryEx {
-    let fallback = |body: String| EntryEx {
-        id: id.to_string(),
-        metadata: Metadata::default(),
-        freeform_body: body,
-    };
-    let text = text.trim_matches('\n').to_string();
-    if !text.starts_with("---") {
-        return fallback(text);
-    }
-    let Some(rel) = text[4..].find("---") else {
-        return fallback(text);
-    };
-    let end = rel + 4;
-    match serde_json::from_str::<Metadata>(text[4..end].trim()) {
-        Ok(metadata) => EntryEx {
-            id: id.to_string(),
-            metadata,
-            freeform_body: text
-                .get(end + 4..)
-                .map(|b| b.trim_start_matches('\n').to_string())
-                .unwrap_or_default(),
-        },
-        Err(_) => {
-            tracing::error!("Diary::parse can't parse {id}");
-            fallback(text)
-        }
-    }
-}
+/// Cap for the kuni `goto naxyi` re-generation loop (kuni retries forever).
+const MAX_PARSE_ATTEMPTS: u32 = 3;
+/// Our pause between kuni's infinite retry loops (kuni busy-retries): a down LLM
+/// endpoint can't spin the consolidation.
+const RETRY_PAUSE_SECS: u64 = 5;
+/// Safety bound of the consolidation outer loop; the real termination is the
+/// deadline / wake-up flag checks.
+const CONSOLIDATION_MAX_ROUNDS: usize = 8192;
+
 
 /// UTC timestamp in the `YYYY-MM-DD hh:mm:ss` form for `Metadata::last_used` and
 /// `format_past_hours` (kuni uses `{}` on `std::chrono::system_clock::now()`).

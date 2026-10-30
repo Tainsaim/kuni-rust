@@ -1,6 +1,8 @@
 //! Worker: the autonomous notification-processing loop.
-//! Port of kuni's `src/Worker.cpp` including the diary injection (`naxyi_populate_ctx`)
-//! and the `diaryDumpMessages` triggers; the sleep machinery ships in phase 4.
+//! Port of kuni's `src/Worker.cpp` including the diary injection
+//! (`naxyi_populate_ctx`), the `diaryDumpMessages` triggers, the random go-sleep
+//! window (which runs the diary sleepingConsolidation) and the
+//! actProactively-aware escape tools.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +26,9 @@ pub struct Worker {
     tools: Arc<StdMutex<BTreeMap<String, tools::Tool>>>,
     /// The `pause`/`wait` escape tools' flag, reset per notification.
     pause_flag: Arc<AtomicBool>,
+    /// kuni's `mWakeUp`: true when the sleep window should end early (papik
+    /// messages call `App::wake_up_if_sleeping`).
+    wake_up: Arc<AtomicBool>,
     /// kuni's `mRelevanceThreshold` (learned while injecting diary entries).
     relevance_threshold: f64,
 }
@@ -37,8 +42,14 @@ impl Worker {
             ask_called: Arc::new(AtomicBool::new(false)),
             tools: Arc::new(StdMutex::new(BTreeMap::new())),
             pause_flag: Arc::new(AtomicBool::new(false)),
+            wake_up: Arc::new(AtomicBool::new(false)),
             relevance_threshold,
         }
+    }
+
+    /// kuni's `Worker::wakeUpIfSleeping`.
+    pub fn wake_up(&self) {
+        self.wake_up.store(true, Ordering::SeqCst);
     }
 
     fn ctx(&self) -> Ctx {
@@ -67,6 +78,55 @@ impl Worker {
         for tool in globals {
             guard.insert(tool.name.clone(), tool);
         }
+    }
+
+    /// kuni's `processRandomlyGoSleep`: 1% chance to go afk for 15–120 minutes
+    /// before processing the notification (it's humane + saves resources). The
+    /// wake-up flag ends the window early. While Kuni sleeps, the diary
+    /// sleepingConsolidation runs (kuni-master triggers it from the debug UI
+    /// instead; a headless kernel sleeps → brain maintenance).
+    async fn process_randomly_go_sleep(&self) {
+        if !self.app.config.get().await.misc.randomly_go_sleep {
+            return;
+        }
+        if rand::rng().random::<f64>() >= 0.01 {
+            return;
+        }
+        let duration_mins = rand::rng().random_range(15..=120i64);
+        tracing::info!("Going to sleep for {duration_mins} minutes");
+        self.wake_up.store(false, Ordering::SeqCst);
+        let duration = std::time::Duration::from_secs(duration_mins as u64 * 60);
+        let deadline = std::time::Instant::now() + duration;
+        let waking = async {
+            loop {
+                if self.wake_up.load(Ordering::SeqCst) {
+                    tracing::info!("Early wake up");
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        };
+        let consolidator = {
+            let diary = self.app.diary.clone();
+            let prompt = self
+                .app
+                .prompts
+                .get(&self.app.prompt_vars().await)
+                .await
+                .sleep_consolidator;
+            async move {
+                diary
+                    .sleeping_consolidation(&prompt, Some(deadline), Some(self.wake_up.clone()))
+                    .await;
+            }
+        };
+        tokio::select! {
+            _ = waking => {}
+            _ = consolidator => {}
+        }
+        // The consolidation may have been dropped mid-run (early wake): make sure
+        // the cache is re-read on next access.
+        self.app.diary.reload().await;
     }
 
     /// kuni's `processShortcutOpen`: a notification with a single action tool
@@ -114,8 +174,30 @@ impl Worker {
 
     /// kuni's `Worker::handleNotification`.
     async fn handle_notification(&mut self, mut notification: Notification) -> Result<(), String> {
+        self.process_randomly_go_sleep().await;
         self.ask_called.store(false, Ordering::SeqCst);
         self.pause_flag.store(false, Ordering::SeqCst);
+
+        // kuni's onStartedProcessing/onProcessed handlers on mActingProactively.
+        let acting = notification.pin.as_deref() == Some(crate::app::PROACTIVE_PIN);
+        if acting {
+            self.app
+                .acting_proactively
+                .store(true, Ordering::SeqCst);
+        }
+        let result = self.handle_notification_inner(notification).await;
+        if acting {
+            self.app
+                .acting_proactively
+                .store(false, Ordering::SeqCst);
+        }
+        result
+    }
+
+    async fn handle_notification_inner(
+        &mut self,
+        mut notification: Notification,
+    ) -> Result<(), String> {
         {
             let seeded = notification.actions.tools.lock().unwrap().clone();
             *self.tools.lock().unwrap() = seeded;
@@ -138,16 +220,14 @@ impl Worker {
             // kuni's naxyi_preserve_ctx:
             self.update_tools().await;
 
-            // escape tools (kuni inserts them right before the LLM call).
+            // escape tools (kuni inserts them right before the LLM call). While
+            // acting proactively, a wait asks Kuni to keep trying to write someone.
+            let nudge = Some((self.app.clone(), self.app.acting_proactively.clone()));
             {
                 let mut guard = self.tools.lock().unwrap();
                 guard.insert(
                     "pause".to_string(),
-                    tools::escape_tool(
-                        "pause",
-                        "Pauses the conversation",
-                        self.pause_flag.clone(),
-                    ),
+                    tools::escape_tool("pause", "Pauses the conversation", self.pause_flag.clone(), nudge.clone()),
                 );
                 guard.insert(
                     "wait".to_string(),
@@ -155,6 +235,7 @@ impl Worker {
                         "wait",
                         "Wait until further notifications",
                         self.pause_flag.clone(),
+                        nudge.clone(),
                     ),
                 );
             }
@@ -452,6 +533,7 @@ pub async fn spawn_workers(app: &Arc<App>) {
         let runner = app.notifications.run().await;
         let worker = Worker::new(app.clone(), relevance_threshold);
         app.worker_sessions.lock().unwrap().push(worker.session.clone());
+        app.worker_wakeups.lock().unwrap().push(worker.wake_up.clone());
         tokio::spawn(WorkerRunner { worker, runner }.loop_forever());
     }
 }

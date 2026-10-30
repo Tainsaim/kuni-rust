@@ -18,6 +18,8 @@ use anyhow::Result;
 use grammers_client::Client;
 use grammers_mtsender::{SenderPool, UpdatesConfiguration};
 
+use rand::Rng as _;
+
 const SESSION_FILE: &str = "kuni.session";
 
 fn init_logging() {
@@ -76,6 +78,19 @@ async fn main() -> Result<()> {
     app::init(&app).await?;
     app.refresh_config().await;
     worker::spawn_workers(&app).await;
+
+    // kuni's mWakeupTimer (27min): a 50% chance to actProactively() — reflect on a
+    // random diary entry.
+    let timer_app = app.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(27 * 60)).await;
+            if rand::rng().random::<f64>() < 0.5 {
+                continue;
+            }
+            timer_app.act_proactively().await;
+        }
+    });
 
     let client = Client::new(handle.clone());
     let mut stream = client
