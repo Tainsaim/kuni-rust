@@ -334,7 +334,7 @@ impl Tg {
             self.gate.wait().await;
             // StdRng (not ThreadRng, which is !Send) so it may live across awaits.
             let mut rng =
-                rand::rngs::StdRng::from_rng(&mut rand::rng()).expect("rng seed");
+                rand::rngs::StdRng::from_os_rng();
 
             // Typing simulation: only when the previous message in the chat is recent
             // (kuni: typing delay applies if the previous message was sent < 5s ago).
@@ -576,7 +576,7 @@ impl Tg {
         if let tl::enums::contacts::Contacts::Contacts(contacts) = result {
             for user in contacts.users {
                 let peer =
-                    grammers_client::peer::Peer::from_user(&self.client, user);
+                    Peer::User(User::from_raw(&self.client, user));
                 self.remember_peer(&peer).await;
                 if let Some(id) = peer.id().bot_api_dialog_id() {
                     ids.push(id);

@@ -17,7 +17,6 @@ use crate::config::ConfigHub;
 pub enum Role {
     #[default]
     System,
-    System,
     User,
     Assistant,
     Tool,

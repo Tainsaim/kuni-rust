@@ -535,11 +535,7 @@ to_days_ago=1 means \"between a week ago and yesterday\". Omit both to search th
                     .map(|l| l.clamp(1, 50) as usize)
                     .unwrap_or(20);
 
-                let my_id = app
-                    .tg
-                    .my_id()
-                    .await
-                    .map_err(anyhow_to_string)?;
+                let my_id = app.tg.my_id().await?;
                 let character_name = cfg.general.character_name.clone();
 
                 let mut results: Vec<grammers_client::message::Message> = Vec::new();
@@ -684,7 +680,7 @@ around it (e.g. to understand what was being discussed).\n\
                 }
 
                 let cfg = app.config.get().await;
-                let my_id = app.tg.my_id().await.map_err(anyhow_to_string)?;
+                let my_id = app.tg.my_id().await?
                 let peer = app.tg.peer_ref(chat_id).await?;
 
                 // Newer messages (ids > target), oldest first.
@@ -896,6 +892,7 @@ require contacting when things go wrong (e.g. begging for money, scam, politics 
                 for (user, rank) in &admins {
                     let username = user.username().unwrap_or("");
                     let name = user.full_name();
+                    let rank = rank.as_deref().unwrap_or("");
                     out.push_str(&format!(
                         "<admin name=\"{name}\" username=\"{username}\" rank=\"{rank}\" user_id=\"{}\" />\n",
                         user.id().bot_api_dialog_id().unwrap_or(0)

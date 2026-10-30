@@ -60,7 +60,7 @@ pub struct App {
     pub handle: grammers_mtsender::SenderPoolFatHandle,
     pub llm: Llm,
     pub prompts: Arc<PromptStore>,
-    pub notifications: Arc<notifications::NotificationManager>,
+    pub notifications: Arc<NotificationManager>,
     /// Dialog id of the chat the LLM currently generates a reply in
     /// (kuni's `mCurrentlyOpenedChat`, used by the typing indicator); 0 = none.
     pub currently_opened_chat: std::sync::atomic::AtomicI64,
@@ -73,7 +73,7 @@ impl App {
         handle: grammers_mtsender::SenderPoolFatHandle,
         llm: Llm,
         prompts: Arc<PromptStore>,
-        notifications: Arc<notifications::NotificationManager>,
+        notifications: Arc<NotificationManager>,
     ) -> Self {
         Self {
             config,
