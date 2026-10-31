@@ -597,8 +597,7 @@ pub fn escape_tool(
     }
 }
 
-/// tools::getTelegramChats (the proactive filtering of the isActingProactively mode
-/// arrives with phase 4).
+/// tools::getTelegramChats, including kuni's proactive-mode filtering.
 pub fn get_telegram_chats(app: Arc<App>) -> Tool {
     Tool {
         name: "get_telegram_chats".into(),
@@ -611,11 +610,20 @@ chats and unread chats, or to start a new conversation."
             let app = app.clone();
             Box::pin(async move {
                 let chats = app.tg.get_chats(50).await?;
+                let acting_proactively = app.is_acting_proactively();
                 let mut result = String::from(
                     "You are currently looking at Telegram's main screen. Use see the following chats:\n",
                 );
                 let now = jiff::Timestamp::now();
-                for entry in &chats {
+                // Oldest first, newest last (chats in queue), because the LLM tends
+                // to prioritize chats from the top of the list. During proactive
+                // mode, hide active/unread chats: the point is to revisit older
+                // chats with no activity; active ones produce notifications anyway.
+                for entry in chats
+                    .iter()
+                    .rev()
+                    .filter(|entry| !acting_proactively || entry.unread == 0)
+                {
                     result.push_str(&llmui::dialog::format_chat_single(
                         entry.id,
                         &entry.peer,

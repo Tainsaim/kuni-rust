@@ -97,17 +97,10 @@ impl Worker {
         self.wake_up.store(false, Ordering::SeqCst);
         let duration = std::time::Duration::from_secs(duration_mins as u64 * 60);
         let deadline = std::time::Instant::now() + duration;
-        let waking = async {
-            loop {
-                if self.wake_up.load(Ordering::SeqCst) {
-                    tracing::info!("Early wake up");
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-        };
+        let wake_up = self.wake_up.clone();
         let consolidator = {
             let diary = self.app.diary.clone();
+            let abort = wake_up.clone();
             let prompt = self
                 .app
                 .prompts
@@ -116,13 +109,32 @@ impl Worker {
                 .sleep_consolidator;
             async move {
                 diary
-                    .sleeping_consolidation(&prompt, Some(deadline), Some(self.wake_up.clone()))
+                    .sleeping_consolidation(&prompt, Some(deadline), Some(abort))
                     .await;
             }
         };
-        tokio::select! {
-            _ = waking => {}
-            _ = consolidator => {}
+
+        // Consolidation is brain maintenance performed *during* sleep; finishing
+        // it early (for example, because the diary is empty) must not end the
+        // 15–120 minute AFK window. Keep waiting until the deadline or papik's
+        // wake-up signal while allowing consolidation to run in parallel.
+        let mut consolidator = Box::pin(consolidator);
+        let mut consolidation_done = false;
+        while std::time::Instant::now() < deadline && !wake_up.load(Ordering::SeqCst) {
+            let tick = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(std::time::Duration::from_secs(1));
+            if consolidation_done {
+                tokio::time::sleep(tick).await;
+            } else {
+                tokio::select! {
+                    _ = &mut consolidator => consolidation_done = true,
+                    _ = tokio::time::sleep(tick) => {}
+                }
+            }
+        }
+        if wake_up.load(Ordering::SeqCst) {
+            tracing::info!("Early wake up");
         }
         // The consolidation may have been dropped mid-run (early wake): make sure
         // the cache is re-read on next access.
@@ -173,7 +185,7 @@ impl Worker {
     }
 
     /// kuni's `Worker::handleNotification`.
-    async fn handle_notification(&mut self, mut notification: Notification) -> Result<(), String> {
+    async fn handle_notification(&mut self, notification: Notification) -> Result<(), String> {
         self.process_randomly_go_sleep().await;
         self.ask_called.store(false, Ordering::SeqCst);
         self.pause_flag.store(false, Ordering::SeqCst);

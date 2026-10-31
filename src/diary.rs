@@ -421,6 +421,9 @@ impl Diary {
                 .map(|t| t.as_secs() as i64)
                 .unwrap_or(0);
             let count = self.cache_loaded().await.as_ref().unwrap().len();
+            if count == 0 {
+                break 'outer;
+            }
             let sleep_start = std::time::Instant::now();
 
             while !self.cache_loaded().await.as_ref().unwrap().is_empty() {
@@ -631,6 +634,38 @@ const RETRY_PAUSE_SECS: u64 = 5;
 /// Safety bound of the consolidation outer loop; the real termination is the
 /// deadline / wake-up flag checks.
 const CONSOLIDATION_MAX_ROUNDS: usize = 8192;
+
+/// kuni's `Diary::parse` lambda: extracts the `---json---` prologue; falls back to
+/// the whole (trimmed) text with default metadata on failure.
+fn parse_one(id: &str, text: &str) -> EntryEx {
+    let fallback = |body: String| EntryEx {
+        id: id.to_string(),
+        metadata: Metadata::default(),
+        freeform_body: body,
+    };
+    let text = text.trim_matches('\n').to_string();
+    if !text.starts_with("---") {
+        return fallback(text);
+    }
+    let Some(rel) = text[4..].find("---") else {
+        return fallback(text);
+    };
+    let end = rel + 4;
+    match serde_json::from_str::<Metadata>(text[4..end].trim()) {
+        Ok(metadata) => EntryEx {
+            id: id.to_string(),
+            metadata,
+            freeform_body: text
+                .get(end + 4..)
+                .map(|b| b.trim_start_matches('\n').to_string())
+                .unwrap_or_default(),
+        },
+        Err(_) => {
+            tracing::error!("Diary::parse can't parse {id}");
+            fallback(text)
+        }
+    }
+}
 
 
 /// UTC timestamp in the `YYYY-MM-DD hh:mm:ss` form for `Metadata::last_used` and
