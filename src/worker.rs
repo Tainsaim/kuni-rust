@@ -47,11 +47,6 @@ impl Worker {
         }
     }
 
-    /// kuni's `Worker::wakeUpIfSleeping`.
-    pub fn wake_up(&self) {
-        self.wake_up.store(true, Ordering::SeqCst);
-    }
-
     fn ctx(&self) -> Ctx {
         Ctx {
             app: self.app.clone(),
