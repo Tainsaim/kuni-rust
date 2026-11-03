@@ -566,7 +566,8 @@ impl Llm {
         let resp = tokio::time::timeout(timeout, req_builder.send())
             .await
             .map_err(|_| "image-to-text request timed out".to_string())?
-            .and_then(|r| r.error_for_status().map_err(|e| format!("LLM request failed: {e}")))?;
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| format!("LLM request failed: {e}"))?;
 
         let json: Value = resp
             .json()
@@ -634,7 +635,8 @@ impl Llm {
         let resp = tokio::time::timeout(timeout, req.send())
             .await
             .map_err(|_| "transcription request timed out".to_string())?
-            .and_then(|r| r.error_for_status().map_err(|e| format!("LLM request failed: {e}")))?;
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| format!("LLM request failed: {e}"))?;
         let json: Value = resp
             .json()
             .await
