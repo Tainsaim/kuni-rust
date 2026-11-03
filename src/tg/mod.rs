@@ -47,6 +47,8 @@ fn dialog_flags(raw: &tl::enums::Dialog) -> DialogFlags {
             pinned: d.pinned,
             muted: false,
         },
+        // Community entries (moved chats) carry no pin/mute state of their own.
+        tl::enums::Dialog::Community(_) => DialogFlags::default(),
     }
 }
 
@@ -256,8 +258,25 @@ impl Tg {
             let peer = dialog.peer;
             if let Some(id) = peer.id().bot_api_dialog_id() {
                 let unread = crate::llmui::dialog::dialog_unread(&dialog.raw);
-                let flags = dialog_flags(&dialog.raw);
-                flags_map.insert(id, flags);
+                // TDLib surfaces one chat per peer (merging the main dialog with
+                // archive-folder entries); the raw list has them separately, so a
+                // folder entry must only add its `pinned`, never clobber the mute
+                // state of the real dialog.
+                match &dialog.raw {
+                    tl::enums::Dialog::Dialog(_) => {
+                        flags_map.insert(id, dialog_flags(&dialog.raw));
+                    }
+                    tl::enums::Dialog::Folder(_) => {
+                        if dialog_flags(&dialog.raw).pinned {
+                            flags_map.entry(id).or_insert_with(|| {
+                                let mut f = DialogFlags::default();
+                                f.pinned = true;
+                                f
+                            });
+                        }
+                    }
+                    tl::enums::Dialog::Community(_) => {}
+                }
                 out.push(ChatListEntry {
                     id,
                     peer,
