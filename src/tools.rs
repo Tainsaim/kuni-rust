@@ -884,6 +884,8 @@ to_days_ago=1 means \"between a week ago and yesterday\". Omit both to search th
                     return Ok("No messages found matching your query.".to_string());
                 }
 
+                // kuni's temporaryContext for the media captioning pipeline.
+                let ctx_items: Vec<crate::llm::Message> = ctx.session.lock().unwrap().clone();
                 let mut out = format!(
                     "<search_results total_count=\"{}\" returned_count=\"{}\">\n",
                     total_count,
@@ -895,7 +897,7 @@ to_days_ago=1 means \"between a week ago and yesterday\". Omit both to search th
                         .unwrap_or(0);
                     let tag = format!("message chat_id=\"{id}\"");
                     out.push_str(
-                        &llmui::format_history_message(&app.tg, r, my_id, &character_name, 0, &tag)
+                        &llmui::format_history_message(&app, &ctx_items, r, my_id, &character_name, 0, &tag)
                             .await?,
                     );
                     out.push('\n');
@@ -988,6 +990,8 @@ around it (e.g. to understand what was being discussed).\n\
                 }
 
                 let character_name = cfg.general.character_name.clone();
+                // kuni's temporaryContext for the media captioning pipeline.
+                let ctx_items: Vec<crate::llm::Message> = ctx.session.lock().unwrap().clone();
                 let mut out = format!("<messages_around message_id=\"{message_id}\">\n");
                 for m in &around {
                     let tag = if m.id() == message_id as i32 {
@@ -996,7 +1000,7 @@ around it (e.g. to understand what was being discussed).\n\
                         "message".to_string()
                     };
                     out.push_str(
-                        &llmui::format_history_message(&app.tg, m, my_id, &character_name, 0, &tag)
+                        &llmui::format_history_message(&app, &ctx_items, m, my_id, &character_name, 0, &tag)
                             .await?,
                     );
                     out.push('\n');
@@ -1008,7 +1012,7 @@ around it (e.g. to understand what was being discussed).\n\
                         "message".to_string()
                     };
                     out.push_str(
-                        &llmui::format_history_message(&app.tg, m, my_id, &character_name, 0, &tag)
+                        &llmui::format_history_message(&app, &ctx_items, m, my_id, &character_name, 0, &tag)
                             .await?,
                     );
                     out.push('\n');
@@ -1561,15 +1565,30 @@ based on their profile photo.",
             opened.title
         ),
         properties: vec![],
-        handler: Arc::new(move |_| {
+        handler: Arc::new(move |ctx| {
             let app = app.clone();
+            let opened = opened.clone();
             Box::pin(async move {
-                if app.config.get().await.capabilities.vision.llm_image_to_text.is_none() {
-                    return Ok(
-                        "Error: photo viewing is not available (no vision model configured).".to_string(),
-                    );
-                }
-                Ok("Error: chat photo retrieval is not implemented yet.".to_string())
+                // freestanding function: sometimes the LLM checks a person's photo
+                // without any instruction (kuni's comment).
+                let Some(photo) = app
+                    .tg
+                    .download_chat_photo_bytes(opened.chat_id)
+                    .await
+                    .map_err(err_display)?
+                else {
+                    return Ok(format!(
+                        "<chat_photo chat_name=\"{}\">Chat \"{}\" has no photo.</chat_photo>",
+                        opened.title, opened.title
+                    ));
+                };
+                let ctx_items: Vec<crate::llm::Message> = ctx.session.lock().unwrap().clone();
+                let image =
+                    crate::media::describe_image(&app, &ctx_items, &photo, "photo").await;
+                Ok(format!(
+                    "<chat_photo chat_name=\"{}\">{}</chat_photo>\nThis is avatar photo of \"{}\". When referring to it, let the person know that you are referring to their avatar.",
+                    opened.title, image, opened.title
+                ))
             })
         }),
     }

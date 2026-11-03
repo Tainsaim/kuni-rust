@@ -18,6 +18,8 @@ const DEFAULT_EPILOGUE: &str = include_str!("../prompts/messages_epilogue.md");
 const DEFAULT_ANTI_REPEAT: &str = include_str!("../prompts/anti_repeat.md");
 const DEFAULT_DIARY_SAVE: &str = include_str!("../prompts/diary_save.md");
 const DEFAULT_SLEEP_CONSOLIDATOR: &str = include_str!("../prompts/sleep_consolidator.md");
+const DEFAULT_PHOTO_TO_TEXT: &str = include_str!("../prompts/photo_to_text.md");
+const DEFAULT_STICKER_TO_TEXT: &str = include_str!("../prompts/sticker_to_text.md");
 
 const RELOAD_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -34,6 +36,9 @@ pub struct RawPrompts {
     pub diary_save: String,
     /// System prompt of the sleep-time consolidation pass (`prompts().sleepConsolidator`).
     pub sleep_consolidator: String,
+    /// Vision captioning system prompts (`prompts().photoToText` / `stickerToText`).
+    pub photo_to_text: String,
+    pub sticker_to_text: String,
 }
 
 /// Rendered prompts with the variables substituted (kuni's `Prompts` after `promptPrintf`).
@@ -46,6 +51,8 @@ pub struct Prompts {
     pub anti_repeat: String,
     pub diary_save: String,
     pub sleep_consolidator: String,
+    pub photo_to_text: String,
+    pub sticker_to_text: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -77,6 +84,8 @@ impl PromptStore {
         Self::seed_once(&dir, "anti_repeat.md", DEFAULT_ANTI_REPEAT).await?;
         Self::seed_once(&dir, "diary_save.md", DEFAULT_DIARY_SAVE).await?;
         Self::seed_once(&dir, "sleep_consolidator.md", DEFAULT_SLEEP_CONSOLIDATOR).await?;
+        Self::seed_once(&dir, "photo_to_text.md", DEFAULT_PHOTO_TO_TEXT).await?;
+        Self::seed_once(&dir, "sticker_to_text.md", DEFAULT_STICKER_TO_TEXT).await?;
 
         let raw = Self::load_all(&dir).await?;
         let store = Arc::new(Self {
@@ -148,6 +157,12 @@ impl PromptStore {
         let sleep_consolidator_raw = read_file("sleep_consolidator.md")
             .await
             .unwrap_or_else(|| DEFAULT_SLEEP_CONSOLIDATOR.to_string());
+        let photo_to_text_raw = read_file("photo_to_text.md")
+            .await
+            .unwrap_or_else(|| DEFAULT_PHOTO_TO_TEXT.to_string());
+        let sticker_to_text_raw = read_file("sticker_to_text.md")
+            .await
+            .unwrap_or_else(|| DEFAULT_STICKER_TO_TEXT.to_string());
         Ok(RawPrompts {
             system: Self::strip_header(&system_raw).to_string(),
             character_base: Self::strip_header(&base_raw).to_string(),
@@ -155,6 +170,8 @@ impl PromptStore {
             messages_epilogue: Self::strip_header(&epilogue_raw).to_string(),
             diary_save: Self::strip_header(&diary_save_raw).to_string(),
             sleep_consolidator: Self::strip_header(&sleep_consolidator_raw).to_string(),
+            photo_to_text: Self::strip_header(&photo_to_text_raw).to_string(),
+            sticker_to_text: Self::strip_header(&sticker_to_text_raw).to_string(),
             anti_repeat: anti_raw
                 .as_deref()
                 .map(Self::strip_header)
@@ -175,6 +192,8 @@ impl PromptStore {
             anti_repeat: Self::substitute(&raw.anti_repeat, vars),
             diary_save: Self::substitute(&raw.diary_save, vars),
             sleep_consolidator: Self::substitute(&raw.sleep_consolidator, vars),
+            photo_to_text: Self::substitute(&raw.photo_to_text, vars),
+            sticker_to_text: Self::substitute(&raw.sticker_to_text, vars),
         }
     }
 
@@ -245,6 +264,8 @@ mod tests {
         assert!(DEFAULT_CHARACTER_APPEARANCE.contains("${CHARACTER_NAME}"));
         assert!(DEFAULT_DIARY_SAVE.contains("outputFormatting"));
         assert!(DEFAULT_SLEEP_CONSOLIDATOR.contains("Sleep-time Consolidator"));
+        assert!(DEFAULT_PHOTO_TO_TEXT.contains("vision captioning module"));
+        assert!(DEFAULT_STICKER_TO_TEXT.contains("sticker interpretation module"));
         // Stripped body has no leftover header.
         assert!(!PromptStore::strip_header(DEFAULT_SYSTEM).starts_with("---"));
         assert!(!PromptStore::strip_header(DEFAULT_CHARACTER_BASE).starts_with("---"));

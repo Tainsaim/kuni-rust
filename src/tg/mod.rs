@@ -320,6 +320,38 @@ impl Tg {
         self.get_dialog_flags(dialog_id).await.pinned
     }
 
+    /// Loads a downloadable media (message photo, sticker, document) fully into
+    /// memory (kuni's `llmui::fetchMedia` + `AByteBuffer::fromStream`). Telegram
+    /// photos resolve to the largest size (grammers does the kuni max_element pick).
+    pub async fn download_media_bytes(
+        &self,
+        media: &grammers_client::media::Media,
+    ) -> TgResult<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut iter = self.client.iter_download(media);
+        while let Some(chunk) = iter.next().await.map_err(err)? {
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+
+    /// Downloads the big variant of a peer's profile/chat photo
+    /// (kuni's `chat->photo_->big_`); `None` when the peer has no photo.
+    pub async fn download_chat_photo_bytes(&self, dialog_id: i64) -> TgResult<Option<Vec<u8>>> {
+        let Some(peer) = self.chat(dialog_id).await else {
+            return Ok(None);
+        };
+        let Some(photo) = peer.photo(true).await.map_err(err)? else {
+            return Ok(None);
+        };
+        let mut out = Vec::new();
+        let mut iter = self.client.iter_download(&photo);
+        while let Some(chunk) = iter.next().await.map_err(err)? {
+            out.extend_from_slice(&chunk);
+        }
+        Ok(Some(out))
+    }
+
     /// Marks the whole chat as read (kuni's `viewMessages`).
     pub async fn mark_read(&self, dialog_id: i64) -> TgResult<()> {
         let peer = self.peer_ref(dialog_id).await?;

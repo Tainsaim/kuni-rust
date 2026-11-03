@@ -2,6 +2,7 @@
 *.session
 config.toml
 data/
+cache/
 # prompts/ is tracked (seeded defaults); the runtime hot-reloads it
 !prompts/
 !prompts/*.md

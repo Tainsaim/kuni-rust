@@ -48,6 +48,13 @@ pub struct ToolCall {
 /// containing it are replaced with "malicious" (llmui/checkForMaliciousPayloads).
 pub const EMBEDDING_TAG: &str = "kuni_embedding";
 
+/// kuni's `IOpenAIChat::embedImage`: wraps a base64 JPEG as the inline data-URI the
+/// session serializer turns into an `image_url` part. The JPEG itself must be
+/// downscaled to fit 672x672 first (kuni's `resizedLinearDownscale`, media.rs).
+pub fn embed_image(jpeg_base64: &str) -> String {
+    format!("<{EMBEDDING_TAG}>data:image/jpg;base64,{jpeg_base64}</{EMBEDDING_TAG}>")
+}
+
 /// One entry of the LLM conversation context (kuni's `Session` element).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Message {
@@ -104,6 +111,68 @@ impl Message {
             obj["tool_call_id"] = json!(self.tool_call_id);
         }
         obj
+    }
+
+    /// kuni's `AJsonConv<IOpenAIChat::Session>::toJson`: messages carrying inline
+    /// `<kuni_embedding>` image data-URIs are expanded into `<attachments>` messages
+    /// plus a `{type: "image_url"}` content part (a scheme reverse-engineered from
+    /// the VSCode copilot plugin; applied to every endpoint request).
+    pub fn to_api_expanded(messages: &[Message]) -> Vec<Value> {
+        let mut out = Vec::with_capacity(messages.len());
+        let open = format!("<{EMBEDDING_TAG}>");
+        let close = format!("</{EMBEDDING_TAG}>");
+        for message in messages {
+            if !message.content.contains(&close) {
+                out.push(message.to_api());
+                continue;
+            }
+            let role = message.role.as_str();
+            let mut rest: &str = &message.content;
+            loop {
+                let head = match rest.find(&open) {
+                    Some(pos) => {
+                        let head = &rest[..pos];
+                        rest = &rest[pos..];
+                        head
+                    }
+                    None => {
+                        let head = rest;
+                        rest = "";
+                        head
+                    }
+                };
+                if !head.is_empty() {
+                    out.push(json!({ "role": role, "content": head }));
+                }
+                if rest.is_empty() {
+                    break;
+                }
+                // `rest` starts with the opening tag; the payload runs up to the
+                // closing tag (kuni skips to the first '>' and back).
+                let payload = &rest[open.len().min(rest.len())..];
+                match payload.split_once(&close) {
+                    Some((body, tail)) => {
+                        // kuni appends "<attachments>" always; empty text heads are
+                        // skipped, these three are emitted as-is.
+                        out.push(json!({ "role": role, "content": "<attachments>" }));
+                        out.push(json!({
+                            "role": role,
+                            "content": [{ "type": "image_url", "image_url": body }],
+                        }));
+                        out.push(json!({ "role": role, "content": "</attachments>" }));
+                        rest = tail;
+                    }
+                    None => {
+                        // Malformed tag (no closing tag after the opening one): keep
+                        // the remaining content verbatim as plain text instead of
+                        // looping (kuni's index math would spin forever here).
+                        out.push(json!({ "role": role, "content": rest }));
+                        break;
+                    }
+                }
+            }
+        }
+        out
     }
 }
 
@@ -332,7 +401,7 @@ impl Llm {
                 messages_json.push(json!({ "role": "system", "content": system_prompt }));
             }
         }
-        messages_json.extend(messages.iter().map(Message::to_api));
+        messages_json.extend(Message::to_api_expanded(messages));
 
         let mut body = json!({
             "model": emd.model,
@@ -450,6 +519,130 @@ impl Llm {
             .send()
             .await
             .map_err(|e| format!("LLM request failed: {e}"))
+    }
+
+    /// kuni's `openAI.chat(...)` — a one-shot non-streaming completion against a
+    /// specific endpoint+model (used by the vision pipeline with
+    /// `llm_image_to_text`). Stream is off and the default kuni token budget
+    /// (`ChatParams::maxOutputTokens = 8192`) applies.
+    pub async fn chat_once(
+        &self,
+        emd: &crate::config::EndpointAndModel,
+        system_prompt: Option<&str>,
+        messages: &[Message],
+    ) -> Result<Message, String> {
+        let cfg = self.config.get().await;
+        let url = chat_url(&emd.endpoint.base_url);
+        let bearer = reqwest::header::HeaderValue::from_str(&format!(
+            "Bearer {}",
+            emd.endpoint.bearer_key
+        ))
+        .map_err(|_| "invalid bearer_key characters".to_string())?;
+        let timeout = Duration::from_secs(cfg.misc.request_timeout_secs);
+        let misc = cfg.misc.clone();
+        drop(cfg);
+
+        let mut messages_json = Vec::new();
+        if let Some(system_prompt) = system_prompt.filter(|p| !p.is_empty()) {
+            messages_json.push(json!({ "role": "system", "content": system_prompt }));
+        }
+        messages_json.extend(Message::to_api_expanded(messages));
+
+        let mut body = json!({
+            "model": emd.model,
+            "messages": messages_json,
+            "stream": false,
+            "max_tokens": 8192,
+        });
+        for (k, v) in Self::options_json(&misc).as_object().unwrap() {
+            body.as_object_mut().unwrap().insert(k.clone(), v.clone());
+        }
+
+        let mut req_builder = self.http.post(&url).json(&body);
+        if !emd.endpoint.bearer_key.is_empty() {
+            req_builder = req_builder.header(reqwest::header::AUTHORIZATION, bearer);
+        }
+
+        let resp = tokio::time::timeout(timeout, req_builder.send())
+            .await
+            .map_err(|_| "image-to-text request timed out".to_string())?
+            .and_then(|r| r.error_for_status().map_err(|e| format!("LLM request failed: {e}")))?;
+
+        let json: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("bad image-to-text response: {e}"))?;
+        let msg = json
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|c| c.first())
+            .and_then(|c| c.get("message"))
+            .cloned()
+            .ok_or_else(|| "image-to-text response has no choices".to_string())?;
+        Ok(Message {
+            role: Role::Assistant,
+            content: msg
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            reasoning_content: msg
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            ..Default::default()
+        })
+    }
+
+    /// kuni's `IOpenAIChat::transcribeAudio`: multipart POST to the whisper
+    /// `audio/transcriptions` endpoint, returns the `text` field (the verbose_json
+    /// response body carries more, but kuni uses only the full text plus the
+    /// segments are unused by callers).
+    pub async fn transcribe_audio(&self, bytes: Vec<u8>, format: &str) -> Result<String, String> {
+        let cfg = self.config.get().await;
+        let emd = cfg
+            .capabilities
+            .hearing
+            .llm_audio_to_text
+            .clone()
+            .ok_or("no audio transcription model configured")?;
+        let timeout = Duration::from_secs(cfg.misc.request_timeout_secs);
+        drop(cfg);
+
+        let url = format!("{}/audio/transcriptions", emd.endpoint.base_url.trim_end_matches('/'));
+        let mime = format!("audio/{format}");
+        let file = reqwest::multipart::Part::bytes(bytes)
+            .file_name(format!("audio.{format}"))
+            .mime_str(&mime)
+            .map_err(|e| format!("invalid audio part: {e}"))?;
+        let form = reqwest::multipart::Form::new()
+            .text("model", emd.model.clone())
+            .part("file", file)
+            .text("response_format", "verbose_json");
+
+        let mut req = self.http.post(&url).multipart(form);
+        if !emd.endpoint.bearer_key.is_empty() {
+            let bearer = reqwest::header::HeaderValue::from_str(&format!(
+                "Bearer {}",
+                emd.endpoint.bearer_key
+            ))
+            .map_err(|_| "invalid bearer_key characters".to_string())?;
+            req = req.header(reqwest::header::AUTHORIZATION, bearer);
+        }
+
+        let resp = tokio::time::timeout(timeout, req.send())
+            .await
+            .map_err(|_| "transcription request timed out".to_string())?
+            .and_then(|r| r.error_for_status().map_err(|e| format!("LLM request failed: {e}")))?;
+        let json: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("bad transcription response: {e}"))?;
+        json.get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "transcription response has no text".to_string())
     }
 
     /// Embeddings endpoint (kuni's `IOpenAIChat::embedding`).
@@ -577,6 +770,43 @@ mod tests {
         assert_eq!(
             jsons[3]["tool_calls"][0]["function"]["arguments"],
             serde_json::json!("{\"x\":1}")
+        );
+    }
+
+    #[test]
+    fn embedding_expansion() {
+        let content = format!(
+            "hey <{t}>data:image/jpg;base64,QUJD</{t}> tail",
+            t = EMBEDDING_TAG
+        );
+        let out = to_api_expanded(&[Message::user(content)]);
+        assert_eq!(
+            serde_json::Value::Array(out),
+            serde_json::json!([
+                { "role": "user", "content": "hey " },
+                { "role": "user", "content": "<attachments>" },
+                { "role": "user", "content": [{"type": "image_url", "image_url": "data:image/jpg;base64,QUJD"}] },
+                { "role": "user", "content": "</attachments>" },
+                { "role": "user", "content": " tail" },
+            ])
+        );
+        // Messages without the tag keep the plain shape.
+        let plain = to_api_expanded(&[Message::user("hi")]);
+        assert_eq!(plain, vec![Message::user("hi").to_api()]);
+        // Malformed (unclosed) tag keeps the remaining content verbatim: one closed
+        // pair first, then an opening tag without a closing one.
+        let bad_src = format!("ok <{t}>A</{t}> tail <{t}>oops", t = EMBEDDING_TAG);
+        let bad = to_api_expanded(&[Message::user(bad_src.clone())]);
+        assert_eq!(
+            bad,
+            vec![
+                json!({ "role": "user", "content": "ok " }),
+                json!({ "role": "user", "content": "<attachments>" }),
+                json!({ "role": "user", "content": [{"type": "image_url", "image_url": "A"}] }),
+                json!({ "role": "user", "content": "</attachments>" }),
+                json!({ "role": "user", "content": " tail " }),
+                json!({ "role": "user", "content": format!("<{t}>oops", t = EMBEDDING_TAG) }),
+            ]
         );
     }
 

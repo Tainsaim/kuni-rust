@@ -6,6 +6,7 @@ mod config;
 mod diary;
 mod llm;
 mod llmui;
+mod media;
 mod notifications;
 mod prompts;
 mod tools;

@@ -639,9 +639,13 @@ pub async fn open_telegram_chat(app: &Arc<App>, ctx: &Ctx, chat_id: i64) -> Resu
         result +=
             "If you try to get back to the original chat and type something, you will be sending an extra message to the wrong chat.";
     }
+    // kuni's openChat passes the worker's current temporaryContext into the
+    // captioning pipeline.
+    let ctx_items: Vec<crate::llm::Message> = ctx.session.lock().unwrap().clone();
     for m in &history {
         result += &llmui::format_history_message(
-            &app.tg,
+            app,
+            &ctx_items,
             m,
             my_id,
             &cfg.general.character_name,

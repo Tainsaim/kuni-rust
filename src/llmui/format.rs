@@ -5,7 +5,9 @@ use grammers_client::tl as tl;
 use grammers_client::media::Media;
 use grammers_client::message::Message;
 use grammers_client::peer::Peer;
+use std::sync::Arc;
 
+use crate::app::App;
 use crate::tg::Tg;
 
 /// Formats a timestamp the way the LLM reads it: HH:MM for today, MM-DD HH:MM otherwise.
@@ -111,8 +113,15 @@ fn sender_name(peer: &Peer) -> String {
 ///
 /// `xml_tag` is the tag opening name: "message" by default; kuni's `formatChatHistoryMessage`
 /// extended callers pass e.g. "message target" or "message chat_id=\"123\"".
+/// `context_items` is kuni's `temporaryContext` passed into the media captioning
+/// pipeline (`llmui::image` context items).
+///
+/// Videos, animations, video notes and gifts are not ported: kuni's pipeline for
+/// them needs ffmpeg frame extraction (`llmui::video`), so they keep their plain
+/// text markers.
 pub async fn format_history_message(
-    tg: &Tg,
+    app: &Arc<App>,
+    context_items: &[crate::llm::Message],
     message: &Message,
     my_id: i64,
     character_name: &str,
@@ -143,12 +152,12 @@ pub async fn format_history_message(
             if let Ok(id) = id {
                 line.push_str(&format!(
                     " sender={} forwarded_by={}",
-                    xml_attr(entity_name(tg, id).await),
+                    xml_attr(entity_name(&app.tg, id).await),
                     xml_attr(
                         if sender_id == my_id {
                             character_name.to_string()
                         } else {
-                            entity_name(tg, sender_id).await
+                            entity_name(&app.tg, sender_id).await
                         }
                     )
                 ));
@@ -175,12 +184,15 @@ pub async fn format_history_message(
             if let Ok(Some(reply)) = message.get_reply().await {
                 if let Ok(formatted) =
                     Box::pin(format_history_message(
-                        tg,
+                        app,
+                        context_items,
                         &reply,
                         my_id,
                         character_name,
                         depth + 1,
-                        "message",
+                        // kuni's formatChatHistoryMessage recursion also tags replies
+                        // "reply_to" (which skips the media understanding block too).
+                        "reply_to",
                     ))
                         .await
                 {
@@ -196,6 +208,62 @@ pub async fn format_history_message(
     // Reactions display (count only for now: emoji pairing needs raw interaction data).
     if let Some(count) = message.reaction_count() {
         line.push_str(&format!("<reactions count=\"{count}\" />\n"));
+    }
+    // kuni's media understanding block (telegram.cpp:478-561): photos and stickers
+    // get descriptions from the vision pipeline, voice notes get transcriptions.
+    // Only top-level messages: kuni skips the block for `reply_to` tags.
+    if xml_tag != "reply_to" {
+        if let Some(media) = message.media() {
+            match &media {
+                Media::Photo(_) => {
+                    let bytes = app.tg.download_media_bytes(&media).await;
+                    match bytes {
+                        Ok(bytes) => {
+                            line.push_str(&crate::media::describe_image(app, context_items, &bytes, "photo").await);
+                        }
+                        Err(e) => {
+                            // kuni's fetchMedia failure bubbles as an exception out of
+                            // llmui::image; we degrade gracefully instead of losing
+                            // the whole message.
+                            tracing::warn!("photo download failed: {e}");
+                            line.push_str("<photo description>\nThis media type is not supported\n</photo>\n");
+                        }
+                    }
+                }
+                Media::Sticker(sticker) => {
+                    // kuni builds the tag as `sticker` or `sticker emoji="..."`.
+                    let emoji_val = sticker.emoji();
+                    let tag = if emoji_val.is_empty() {
+                        "sticker".to_string()
+                    } else {
+                        let mut e = emoji_val.to_string();
+                        super::check_malicious_payloads(&mut e);
+                        format!("sticker emoji=\"{e}\"")
+                    };
+                    let bytes = app.tg.download_media_bytes(&media).await;
+                    match bytes {
+                        Ok(bytes) => {
+                            line.push_str(&crate::media::describe_image(app, context_items, &bytes, &tag).await);
+                        }
+                        Err(e) => {
+                            tracing::warn!("sticker download failed: {e}");
+                            line.push_str(&format!("<{tag} description>\nThis media type is not supported\n</{tag}>\n"));
+                        }
+                    }
+                }
+                Media::Document(doc) if doc.raw.voice => {
+                    // kuni's messageVoiceNote branch (llmui::voiceMessageTranscription
+                    // minus the Telegram Premium path).
+                    let bytes = app.tg.download_media_bytes(&media).await;
+                    if let Ok(bytes) = bytes {
+                        line.push_str(&crate::media::transcribe_voice(app, bytes).await);
+                    } else {
+                        tracing::warn!("voice note download failed");
+                    }
+                }
+                _ => {}
+            }
+        }
     }
     // Body: markdown-ish view of the text if present, else media marker.
     let mut text = message.text().to_string();
@@ -214,7 +282,12 @@ pub async fn format_history_message(
     if let Some(author) = message.post_author() {
         line.push_str(&format!("<post_author>{}</post_author>\n", html_escape(author)));
     }
-    line.push_str("</message>");
+    // kuni closes with the full opening tag baked into the closing one
+    // (`"\n</{}>\n"_format(formattedXmlTag)` yields `</message chat_id="123">` — a
+    // broken-XML quirk); we close with the tag name only, which is identical output
+    // for plain "message"/"reply_to" tags.
+    let tag_name = xml_tag.split(' ').next().unwrap_or("message");
+    line.push_str(&format!("</{tag_name}>"));
     Ok(line)
 }
 
