@@ -531,7 +531,7 @@ async fn handle_new_message(app: &Arc<App>, message: &grammers_client::message::
     // priority > 0 wakes up sleeping workers (main.cpp:411).
     let priority = if sender_id == cfg.general.papik_chat_id {
         1000
-    } else if cfg.general.wake_up_on_pinned_chat && app.tg.is_pinned(chat_id).await {
+    } else if cfg.misc.wake_up_on_pinned_chat && app.tg.is_pinned(chat_id).await {
         100
     } else {
         0

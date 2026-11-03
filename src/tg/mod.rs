@@ -38,7 +38,7 @@ fn dialog_flags(raw: &tl::enums::Dialog) -> DialogFlags {
         tl::enums::Dialog::Dialog(d) => DialogFlags {
             pinned: d.pinned,
             muted: match &d.notify_settings {
-                tl::enums::PeerNotifySettings::PeerNotifySettings(n) => {
+                tl::enums::PeerNotifySettings::Settings(n) => {
                     n.mute_until.is_some_and(|t| t > now)
                 }
             },
