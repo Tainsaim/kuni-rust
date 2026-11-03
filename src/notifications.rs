@@ -131,6 +131,12 @@ impl NotificationManager {
 
 
 impl RunningWorker {
+    /// This worker's adopted notification pins (passed to the `Worker` for the
+    /// kuni `Worker::diaryDumpMessages` pin clearing).
+    pub fn pins(&self) -> Arc<StdMutex<std::collections::HashSet<String>>> {
+        self.manager.pins_handle(self.slot)
+    }
+
     /// Waits until a notification this worker may process is available, returning it
     /// with the "\nCurrent time: {utc}" suffix appended (kuni's `run` loop).
     pub async fn next(&mut self) -> Option<Notification> {

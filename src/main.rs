@@ -69,7 +69,6 @@ async fn main() -> Result<()> {
     let app = std::sync::Arc::new(app::App::new(
         config.clone(),
         tg.clone(),
-        handle.clone(),
         llm,
         prompts,
         notifications,

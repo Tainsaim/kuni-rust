@@ -6,7 +6,7 @@
 //! set from inside a handler.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use futures::future::BoxFuture;
@@ -103,7 +103,6 @@ pub struct Tool {
     pub name: String,
     pub description: String,
     pub properties: Vec<(String, Prop)>,
-    pub required: Vec<String>,
     pub handler: Handler,
 }
 
@@ -156,19 +155,6 @@ impl OpenAITools {
                 })
             })
             .collect()
-    }
-
-    pub fn len(&self) -> usize {
-        self.tools.lock().unwrap().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Up-to-date copy of the tool map (for worker merges).
-    pub fn snapshot(&self) -> BTreeMap<String, Tool> {
-        self.tools.lock().unwrap().clone()
     }
 
     /// Names in execution order for the "What's your next action?" hint
@@ -258,7 +244,6 @@ impl OpenAITools {
             out.push(ToolResult {
                 tool_call_id: call.id.clone(),
                 content,
-                tool_name: call.name.clone(),
             });
         }
         out
@@ -270,7 +255,6 @@ impl OpenAITools {
 pub struct ToolResult {
     pub tool_call_id: String,
     pub content: String,
-    pub tool_name: String,
 }
 
 /// `jsonAsLongInt`-ish: accepts integers and numeric strings.
@@ -362,12 +346,59 @@ async fn ask_query_diary(
     Ok(formatted_response)
 }
 
-/// kuni's `queryWeb`; the web search module itself is not ported yet (phase 5).
-async fn ask_query_web(app: &Arc<App>) -> String {
-    if !app.config.get().await.misc.capability_web_search {
+/// Ollama web search's `Result` fields (kuni's `web::SearchResult`).
+#[derive(Debug, Clone, serde::Deserialize)]
+struct WebResult {
+    title: String,
+    url: String,
+    #[serde(default)]
+    content: String,
+}
+
+/// kuni's `web::search` (WebSearch.cpp): POSTs to ollama.com's web search API
+/// with the instance's ollama.com API key, returns the results.
+async fn web_search(bearer: &str, query: &str, max_results: usize) -> Result<Vec<WebResult>, String> {
+    let mut body = serde_json::json!({ "query": query });
+    if max_results > 0 {
+        body["max_results"] = (max_results as i64).into();
+    }
+    let response: serde_json::Value = reqwest::Client::new()
+        .post("https://ollama.com/api/web_search")
+        .header("Authorization", format!("Bearer {bearer}"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(err) = response.get("error") {
+        return Err(format!("Ollama web search error: {err}"));
+    }
+    serde_json::from_value(response["results"].clone())
+        .map_err(|e| format!("invalid ollama web search response: {e}"))
+}
+
+/// kuni's `queryWeb` (ask.cpp): "No web search available" while disabled,
+/// `<web_search_result>` blocks per hit otherwise.
+async fn ask_query_web(app: &Arc<App>, cue: &str) -> String {
+    let cfg = app.config.get().await;
+    if !cfg.misc.capability_web_search {
         return "No web search available".to_string();
     }
-    "No web search available".to_string()
+    match web_search(&cfg.capabilities.web_search.ollama_bearer_key, cue, 0).await {
+        Ok(results) => {
+            let mut out = String::new();
+            for result in &results {
+                out += &format!(
+                    "<web_search_result title=\"{}\" url=\"{}\">\n{}\n</web_search_result>\n",
+                    result.title, result.url, result.content
+                );
+            }
+            out
+        }
+        Err(e) => e,
+    }
 }
 
 /// kuni's `ask()` free function (tools/ask.cpp): the searcher subagent loop.
@@ -398,7 +429,6 @@ async fn ask_subagent(app: &Arc<App>, ctx: &Ctx, query: &str) -> Result<String, 
                 ),
             ),
         ],
-        required: vec!["text".into(), "include_web_search_results".into()],
         handler: {
             let included_ids = included_ids.clone();
             let app = app.clone();
@@ -424,7 +454,7 @@ async fn ask_subagent(app: &Arc<App>, ctx: &Ctx, query: &str) -> Result<String, 
                     if include_web_search_results {
                         out += &format!(
                             "<web_search_results>\n{}\n</web_search_results>\n",
-                            ask_query_web(&app).await
+                            ask_query_web(&app, &cue).await
                         );
                     }
                     Ok(out)
@@ -515,7 +545,6 @@ about their musical activities?\"\n\
             "query".into(),
             Prop::new(Prop::STRING, "Freeform question to the subagent. Provide as much context as possible — include sender name, topic, and what you want to know. It will provide relevant information from diary and web search."),
         )],
-        required: vec!["query".into()],
         handler: Arc::new(move |ctx| {
             let app = app.clone();
             Box::pin(async move {
@@ -565,7 +594,6 @@ pub fn escape_tool(
         name: name.into(),
         description: description.into(),
         properties: vec![],
-        required: vec![],
         handler: Arc::new(move |_ctx| {
             let pause_flag = pause_flag.clone();
             let nudge = nudge.clone();
@@ -605,7 +633,6 @@ pub fn get_telegram_chats(app: Arc<App>) -> Tool {
 chats and unread chats, or to start a new conversation."
             .into(),
         properties: vec![],
-        required: vec![],
         handler: Arc::new(move |_ctx| {
             let app = app.clone();
             Box::pin(async move {
@@ -653,7 +680,6 @@ pub fn search_chats(app: Arc<App>) -> Tool {
             "query".into(),
             Prop::new(Prop::STRING, "The username or name of the chat. Examples: \n- @alex2772sc\n- Alex2772"),
         )],
-        required: vec!["query".into()],
         handler: Arc::new(move |ctx| {
             let app = app.clone();
             Box::pin(async move {
@@ -744,14 +770,6 @@ to_days_ago=1 means \"between a week ago and yesterday\". Omit both to search th
             ("from_days_ago".into(), Prop::new(Prop::INTEGER, "(optional) Only include messages sent at most this many days ago, e.g. 7 = within the last week.").nullable()),
             ("to_days_ago".into(), Prop::new(Prop::INTEGER, "(optional) Only include messages sent at least this many days ago, e.g. 1 = up until yesterday. Use 0 (or omit) for \"up to now\".").nullable()),
             ("limit".into(), Prop::new(Prop::INTEGER, "(optional) Max number of results to return, default 20, capped at 50.").nullable()),
-        ],
-        required: vec![
-            "query".into(),
-            "chat_id".into(),
-            "sender_id".into(),
-            "from_days_ago".into(),
-            "to_days_ago".into(),
-            "limit".into(),
         ],
         handler: Arc::new(move |ctx| {
             let app = app.clone();
@@ -893,10 +911,6 @@ fn err_display(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
-fn anyhow_to_string(e: anyhow::Error) -> String {
-    e.to_string()
-}
-
 /// tools::viewMessagesAround.
 pub fn view_messages_around(app: Arc<App>) -> Tool {
     Tool {
@@ -913,7 +927,6 @@ around it (e.g. to understand what was being discussed).\n\
             ("before".into(), Prop::new(Prop::INTEGER, "(optional) How many older messages to include before the target message. Default 10.").nullable()),
             ("after".into(), Prop::new(Prop::INTEGER, "(optional) How many newer messages to include after the target message. Default 10.").nullable()),
         ],
-        required: vec!["chat_id".into(), "message_id".into(), "before".into(), "after".into()],
         handler: Arc::new(move |ctx| {
             let app = app.clone();
             Box::pin(async move {
@@ -1021,7 +1034,6 @@ specific user to DM you.\nYou should use this if:\n\
             "chat_id".into(),
             Prop::new(Prop::INTEGER, "chat_id to block."),
         )],
-        required: vec!["chat_id".into()],
         handler: Arc::new(move |ctx| {
             let app = app.clone();
             Box::pin(async move {
@@ -1071,7 +1083,6 @@ pub fn open_chat_by_id(app: Arc<App>) -> Tool {
             "chat_id".into(),
             Prop::new(Prop::INTEGER, "The ID of the Telegram chat"),
         )],
-        required: vec!["chat_id".into()],
         handler: Arc::new(move |ctx| {
             let app = app.clone();
             Box::pin(async move {
@@ -1106,7 +1117,6 @@ pub fn join_chat_by_link(app: Arc<App>) -> Tool {
             "invite_link".into(),
             Prop::new(Prop::STRING, "The invite link, e.g. https://t.me/joinchat/xxxx"),
         )],
-        required: vec!["invite_link".into()],
         handler: Arc::new(move |ctx| {
             let app = app.clone();
             Box::pin(async move {
@@ -1136,7 +1146,6 @@ require contacting when things go wrong (e.g. begging for money, scam, politics 
             "chat_id".into(),
             Prop::new(Prop::INTEGER, "The chat to look up admins for (default: the opened chat).").nullable(),
         )],
-        required: vec!["chat_id".into()],
         handler: Arc::new(move |ctx| {
             let app = app.clone();
             Box::pin(async move {
@@ -1163,12 +1172,6 @@ require contacting when things go wrong (e.g. begging for money, scam, politics 
 // Chat tools (constructed per opened chat, like kuni's llmuiOpenTelegramChat)
 // ---------------------------------------------------------------------------
 
-/// Shared mutable state of one opened chat (kuni's `State` struct in sendTelegramMessage).
-pub struct OpenedChatState {
-    pub msgs_in_a_row: AtomicU32,
-    pub last_reply_to: StdMutex<i64>,
-}
-
 /// tools::sendTelegramMessage minus photo/audio paths (this fork does not generate media).
 pub fn send_telegram_message(app: Arc<App>, opened: Arc<OpenedChat>) -> Tool {
     Tool {
@@ -1183,7 +1186,6 @@ pub fn send_telegram_message(app: Arc<App>, opened: Arc<OpenedChat>) -> Tool {
             ("text".into(), Prop::new(Prop::STRING, "Text of the message.").nullable()),
             ("reply_to_message_id".into(), Prop::new(Prop::INTEGER, "If specified, the message will be rendered as a reply to the message with given message id. You must use it if there are multiple messages or to clearly address specific message. Pass null if not replying to anything.").nullable()),
         ],
-        required: vec!["text".into(), "reply_to_message_id".into()],
         handler: Arc::new(move |ctx| {
             let app = app.clone();
             let opened = opened.clone();
@@ -1384,7 +1386,6 @@ pub fn react_with_emoji(app: Arc<App>, opened: Arc<OpenedChat>) -> Tool {
             ("message_id".into(), Prop::new(Prop::INTEGER, "ID of the message to react to. Taken from message_id attribute in <message> tag.")),
             ("emoji".into(), Prop::new(Prop::STRING, "A single emoji from the allowed list only. Do not use emojis outside the list.")),
         ],
-        required: vec!["message_id".into(), "emoji".into()],
         handler: Arc::new(move |ctx| {
             let app = app.clone();
             let opened = opened.clone();
@@ -1418,7 +1419,6 @@ You should use this when you mistakenly sent a message to a wrong chat.",
             Prop::new(Prop::INTEGER, "ID(s) of the message(s) to delete. Taken from message_id attribute in <message> tag.")
                 .or_array(Prop::new(Prop::INTEGER, "")),
         )],
-        required: vec!["message_id".into()],
         handler: Arc::new(move |ctx| {
             let app = app.clone();
             let opened = opened.clone();
@@ -1467,7 +1467,6 @@ You should use this to fix a typo or correct a mistake in a message you already 
             ("message_id".into(), Prop::new(Prop::INTEGER, "ID of the message to edit. Taken from message_id attribute in <message> tag.")),
             ("text".into(), Prop::new(Prop::STRING, "New text for the message. The previous text will be replaced with this one.")),
         ],
-        required: vec!["message_id".into(), "text".into()],
         handler: Arc::new(move |ctx| {
             let app = app.clone();
             let opened = opened.clone();
@@ -1503,7 +1502,6 @@ Use your own chat ID (Saved Messages) to forward to yourself.")),
             ("comment".into(), Prop::new(Prop::STRING, "Optional comment to send after the forwarded message. \
 Express your reaction, thoughts, or why you found this interesting. Pass null to skip the comment.").nullable()),
         ],
-        required: vec!["message_ids".into(), "to_chat_id".into(), "comment".into()],
         handler: Arc::new(move |ctx| {
             let app = app.clone();
             let opened = opened.clone();
@@ -1563,7 +1561,6 @@ based on their profile photo.",
             opened.title
         ),
         properties: vec![],
-        required: vec![],
         handler: Arc::new(move |_| {
             let app = app.clone();
             Box::pin(async move {
@@ -1589,7 +1586,6 @@ of this chat - that's why you can't send messages here yet, only react to them w
             opened.title
         ),
         properties: vec![],
-        required: vec![],
         handler: Arc::new(move |_| {
             let app = app.clone();
             let opened = opened.clone();
@@ -1616,7 +1612,6 @@ instead.",
             opened.title
         ),
         properties: vec![],
-        required: vec![],
         handler: Arc::new(move |_| {
             let app = app.clone();
             let opened = opened.clone();
@@ -1642,7 +1637,6 @@ something prohibited by the chat rules.",
             "message_id".into(),
             Prop::new(Prop::INTEGER, "ID of the message to remove, taken from message_id attribute in <message> tag."),
         )],
-        required: vec!["message_id".into()],
         handler: Arc::new(move |ctx| {
             let app = app.clone();
             let opened = opened.clone();
@@ -1672,7 +1666,6 @@ prohibited by the chat rules.",
             "user_id".into(),
             Prop::new(Prop::INTEGER, "ID of the user to ban, taken from the sender_id attribute in <message> tag."),
         )],
-        required: vec!["user_id".into()],
         handler: Arc::new(move |ctx| {
             let app = app.clone();
             let opened = opened.clone();
@@ -1727,7 +1720,6 @@ pub fn build_open_notification_actions(app: &Arc<App>, chat_id: i64, title: &str
             "Open \"{title}\" chat. Use this if you'd like to reply or see messages."
         ),
         properties: vec![],
-        required: vec![],
         handler: Arc::new(move |ctx| {
             let app = app2.clone();
             let chat_id = chat_id;
@@ -1788,7 +1780,9 @@ pub fn build_chat_tools(
                 opened.clone(),
             ));
             tools.push(group_admin_ban_user(app.clone(), opened.clone()));
-            // tools::groupAdminSetUserTag lands with the diary/tags phase.
+            // kuni's tools::groupAdminSetUserTag is not ported: grammers' TL layer
+            // (0.11) predates Telegram's member-tag API (td setChatMemberTag) —
+            // there is no equivalent constructor in api.tl to invoke.
         }
     }
 

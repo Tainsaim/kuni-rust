@@ -66,7 +66,6 @@ impl OpenedChat {
 pub struct App {
     pub config: Arc<ConfigHub>,
     pub tg: Arc<Tg>,
-    pub handle: grammers_mtsender::SenderPoolFatHandle,
     pub llm: Llm,
     pub prompts: Arc<PromptStore>,
     pub notifications: Arc<NotificationManager>,
@@ -98,7 +97,6 @@ impl App {
     pub fn new(
         config: Arc<ConfigHub>,
         tg: Arc<Tg>,
-        handle: grammers_mtsender::SenderPoolFatHandle,
         llm: Llm,
         prompts: Arc<PromptStore>,
         notifications: Arc<NotificationManager>,
@@ -107,7 +105,6 @@ impl App {
         Self {
             config,
             tg,
-            handle,
             llm,
             prompts,
             notifications,
@@ -493,9 +490,16 @@ async fn handle_new_message(app: &Arc<App>, message: &grammers_client::message::
         return;
     }
 
-    // TODO(phase 4): muted chats get an 80% ignore probability
-    // (needs notify settings from the dialog cache).
-
+    // main.cpp:326-360: muted chats get an 80% ignore probability. Always ignoring
+    // would mean the LLM never reads the chat at all — the probabilistic ignore lets
+    // the account holder mute a spammy chat without fully cutting it off (archiving
+    // a chat removes it completely).
+    {
+        use rand::Rng as _;
+        if app.tg.is_muted(chat_id).await && rand::rng().random::<f64>() < 0.8 {
+            return;
+        }
+    }
     let title = app.tg.chat_title(chat_id).await;
     let cfg = app.config.get().await;
 
@@ -522,10 +526,13 @@ async fn handle_new_message(app: &Arc<App>, message: &grammers_client::message::
     notification += "\n</notification>\n";
     notification += "You don't have any chat open. Use #open tool to open the chat";
 
-    // The priority of the notification (papik always kicks in first;
-    // TODO(phase 4): pinned chats get priority 100 when wake_up_on_pinned_chat).
+    // The priority of the notification (main.cpp:382-395): papik always kicks in
+    // first; a pinned chat gets priority 100 when wake_up_on_pinned_chat is set.
+    // priority > 0 wakes up sleeping workers (main.cpp:411).
     let priority = if sender_id == cfg.general.papik_chat_id {
         1000
+    } else if cfg.general.wake_up_on_pinned_chat && app.tg.is_pinned(chat_id).await {
+        100
     } else {
         0
     };

@@ -39,12 +39,14 @@ fn middle_truncate(s: &str, max_chars: usize) -> String {
 
 /// Best-effort chat/sender title for a cached peer.
 pub fn peer_title(peer: &Peer) -> String {
-    match peer {
+    let mut title = match peer {
         Peer::User(user) => user.full_name(),
         Peer::Group(group) => group.title().unwrap_or("unnamed group").to_string(),
         Peer::Channel(channel) => channel.title().to_string(),
         _ => "unknown".to_string(),
-    }
+    };
+    super::check_malicious_payloads(&mut title);
+    title
 }
 
 /// Single dialog as the LLM sees it:
@@ -73,7 +75,9 @@ pub fn format_chat_single(
             .and_then(|i| i.bot_api_dialog_id())
             .unwrap_or(0)
             .to_string();
-        let preview = middle_truncate(message.text(), 80);
+        let mut text = message.text().to_string();
+        super::check_malicious_payloads(&mut text);
+        let preview = middle_truncate(&text, 80);
         line.push_str(&format!(
             " preview=\"{}\" last_message=\"{}\"",
             escape(&format!("{from}: {preview}")),
@@ -86,21 +90,6 @@ pub fn format_chat_single(
         line.push_str(&format!(" unread_count=\"{unread_count}\""));
     }
     format!("{line} />")
-}
-
-/// Formats a list of dialogs for the `get_telegram_chats` tool.
-pub fn format_chat_list(
-    entries: &[(i64, Peer, u32, Option<Message>)],
-) -> String {
-    // Oldest first so that the most recent conversation is the last one (kuni's ordering).
-    let mut out = String::from("<chat_list>\n");
-    for (id, peer, unread, last) in entries {
-        let now = jiff::Timestamp::now();
-        out.push_str(&format_chat_single(*id, peer, *unread, last.as_ref(), now));
-        out.push('\n');
-    }
-    out.push_str("</chat_list>");
-    out
 }
 
 /// Unread count of a dialog, decoded from the raw TL dialog, or 0.

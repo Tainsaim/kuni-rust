@@ -21,6 +21,35 @@ use crate::tg::human::{err, SendGate, SendStreak, TYPING_DELAY_GRACE};
 
 pub type TgResult<T> = Result<T, String>;
 
+/// Pin/mute state of one dialog (kuni reads `chat->positions_` and
+/// `chat->notification_settings_->mute_for_` for the same purpose).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DialogFlags {
+    pub pinned: bool,
+    pub muted: bool,
+}
+
+/// Decodes pin/mute state from a raw TL dialog. Muted = `mute_until` is in the
+/// future (TDLib's `mute_for_ > 0`; `mute_until` saturates to a far future for
+/// muted-forever). Folder entries carry no notify settings of their own.
+fn dialog_flags(raw: &tl::enums::Dialog) -> DialogFlags {
+    let now = jiff::Timestamp::now().as_second() as i32;
+    match raw {
+        tl::enums::Dialog::Dialog(d) => DialogFlags {
+            pinned: d.pinned,
+            muted: match &d.notify_settings {
+                tl::enums::PeerNotifySettings::PeerNotifySettings(n) => {
+                    n.mute_until.is_some_and(|t| t > now)
+                }
+            },
+        },
+        tl::enums::Dialog::Folder(d) => DialogFlags {
+            pinned: d.pinned,
+            muted: false,
+        },
+    }
+}
+
 /// One recent dialog summary for the chat list tools.
 pub struct ChatListEntry {
     pub id: i64,
@@ -46,6 +75,10 @@ pub struct Tg {
     /// Cached contact list ids for the CONTACTS_ONLY lockdown mode (kuni's static
     /// contacts lookup).
     contacts: tokio::sync::Mutex<Option<Vec<i64>>>,
+    /// Pin/mute state of the recently seen dialogs, refreshed by `get_chats`
+    /// (kuni gets live updates from TDLib; we refetch on dialog-list requests and
+    /// per-chat on demand).
+    dialog_flags: tokio::sync::Mutex<HashMap<i64, DialogFlags>>,
     /// Cached own user id (0 = unset), kuni's `myId()`.
     my_id_cache: std::sync::atomic::AtomicI64,
 }
@@ -68,6 +101,7 @@ impl Tg {
             anti_repeat_cache: std::sync::Mutex::new(HashMap::new()),
             anti_repeat_head_start: std::sync::Mutex::new(0.0),
             contacts: tokio::sync::Mutex::new(None),
+            dialog_flags: tokio::sync::Mutex::new(HashMap::new()),
             my_id_cache: std::sync::atomic::AtomicI64::new(0),
         });
         Ok((tg, pool))
@@ -163,12 +197,6 @@ impl Tg {
         Ok(id)
     }
 
-    /// Cached-only variant of `my_id` for hot paths (returns the id without cache
-    /// refill; callers use `my_id()` once at startup).
-    pub async fn my_id_cached(&self) -> TgResult<i64> {
-        self.my_id().await
-    }
-
     /// Best-effort chat title from the peer cache (fallback "<unknown>").
     pub async fn chat_title(&self, dialog_id: i64) -> String {
         let peer = match self.chat(dialog_id).await {
@@ -222,11 +250,14 @@ impl Tg {
     /// (kuni's `getChats(chatListMain, N)`), oldest first like kuni.
     pub async fn get_chats(&self, limit: usize) -> TgResult<Vec<ChatListEntry>> {
         let mut out = Vec::new();
+        let mut flags_map = HashMap::new();
         let mut iter = self.client.iter_dialogs().limit(limit);
         while let Some(dialog) = iter.next().await.map_err(err)? {
             let peer = dialog.peer;
             if let Some(id) = peer.id().bot_api_dialog_id() {
                 let unread = crate::llmui::dialog::dialog_unread(&dialog.raw);
+                let flags = dialog_flags(&dialog.raw);
+                flags_map.insert(id, flags);
                 out.push(ChatListEntry {
                     id,
                     peer,
@@ -236,44 +267,38 @@ impl Tg {
             }
         }
         out.reverse();
+        *self.dialog_flags.lock().await = flags_map;
         Ok(out)
     }
 
-    /// Startup warm cache (legacy helper, kept for `App::init`).
-    pub async fn warm_cache_dialogs(&self, limit: usize) -> TgResult<Vec<ChatListEntry>> {
-        self.get_chats(limit).await
-    }
-
-    /// Fetches a window of history. Returns messages **oldest first**, trimming
-    /// everything already present in the context (`until_msg_seen`),
-    /// or capped by the accumulated character budget (kuni's pagination loop).
-    pub async fn load_history(
-        &self,
-        dialog_id: i64,
-        limit: usize,
-        until_msg_seen: Option<i32>,
-        max_chars: usize,
-    ) -> TgResult<Vec<Message>> {
-        let peer = self.peer_ref(dialog_id).await?;
-        let mut out = Vec::new();
-        let mut chars = 0;
-        let mut iter = self.client.iter_messages(peer).limit(limit.max(1));
-        while let Some(message) = iter.next().await.map_err(err)? {
-            let id = message.id();
-            chars += message.text().chars().count();
-            out.push(message);
-            if let Some(until) = until_msg_seen {
-                if id <= until {
-                    break;
-                }
-            }
-            if chars >= max_chars {
-                break;
-            }
+    /// Pin/mute state of a chat; unknown chats trigger a one-time refresh of the
+    /// recent dialog list (kuni's TDLib-backed chat cache; our fallback).
+    pub async fn get_dialog_flags(&self, dialog_id: i64) -> DialogFlags {
+        if let Some(flags) = self.dialog_flags.lock().await.get(&dialog_id) {
+            return *flags;
         }
-        // iter_messages yields newest first; reverse for oldest-first ordering.
-        out.reverse();
-        Ok(out)
+        // Not cached: fetch the recent dialogs once (also replenishes the peer
+        // cache) and retry; falls back to "not pinned, not muted".
+        if let Err(e) = self.get_chats(500).await {
+            tracing::debug!("dialog flags refresh for {dialog_id} failed: {e}");
+            return DialogFlags::default();
+        }
+        *self
+            .dialog_flags
+            .lock()
+            .await
+            .get(&dialog_id)
+            .unwrap_or(&DialogFlags::default())
+    }
+
+    /// True when the chat's notifications are currently muted.
+    pub async fn is_muted(&self, dialog_id: i64) -> bool {
+        self.get_dialog_flags(dialog_id).await.muted
+    }
+
+    /// True when the chat is pinned in the main dialog list.
+    pub async fn is_pinned(&self, dialog_id: i64) -> bool {
+        self.get_dialog_flags(dialog_id).await.pinned
     }
 
     /// Marks the whole chat as read (kuni's `viewMessages`).

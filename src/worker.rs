@@ -31,10 +31,16 @@ pub struct Worker {
     wake_up: Arc<AtomicBool>,
     /// kuni's `mRelevanceThreshold` (learned while injecting diary entries).
     relevance_threshold: f64,
+    /// kuni's `mWorkerPins`: notification pins adopted by this worker.
+    pins: Arc<StdMutex<std::collections::HashSet<String>>>,
 }
 
 impl Worker {
-    fn new(app: Arc<App>, relevance_threshold: f64) -> Self {
+    fn new(
+        app: Arc<App>,
+        relevance_threshold: f64,
+        pins: Arc<StdMutex<std::collections::HashSet<String>>>,
+    ) -> Self {
         Self {
             app,
             session: Arc::new(StdMutex::new(Vec::new())),
@@ -44,6 +50,7 @@ impl Worker {
             pause_flag: Arc::new(AtomicBool::new(false)),
             wake_up: Arc::new(AtomicBool::new(false)),
             relevance_threshold,
+            pins,
         }
     }
 
@@ -304,14 +311,39 @@ impl Worker {
             // Execute the tool calls, push the assistant message and the `tool`
             // results into the context, then sprinkle kuni's planning hints onto
             // the last tool result.
-            let did_send = bot
-                .tool_calls
-                .iter()
-                .any(|tc| tc.name == "send_telegram_message");
             let results = self
                 .tool_set()
                 .handle_tool_calls(&self.ctx(), &bot.tool_calls)
                 .await;
+
+            // kuni's EMBEDDING_TAG check (Worker.cpp:303-321): a tool result carrying
+            // the inline-image embedding tag indicates a low quality tool call —
+            // nothing is appended and the LLM regenerates. If the context is already
+            // overflown, ignore the event and dump the context (Worker.cpp:310-316).
+            if results
+                .iter()
+                .any(|r| r.content.contains(crate::llm::EMBEDDING_TAG))
+            {
+                let trigger = self.app.config.get().await.misc.diary_token_count_trigger;
+                if usage.prompt_tokens > trigger as u64 {
+                    tracing::warn!(
+                        "AppBase: LLM can't find proper response to the notification; \
+                         context is overflown. Ignoring event and dumping context"
+                    );
+                    self.diary_dump_messages().await;
+                    return Ok(());
+                }
+                tracing::info!(
+                    "low quality tool call ({}): retrying without appending",
+                    crate::llm::EMBEDDING_TAG
+                );
+                continue;
+            }
+
+            let did_send = bot
+                .tool_calls
+                .iter()
+                .any(|tc| tc.name == "send_telegram_message");
             {
                 let mut session = self.session.lock().unwrap();
                 session.push(bot);
@@ -340,12 +372,19 @@ impl Worker {
                 // token trigger.
                 let trigger = self.app.config.get().await.misc.diary_token_count_trigger;
                 if usage.total_tokens() >= trigger as u64 {
-                    if let Err(e) = App::diary_dump_messages(&self.app, &self.session).await {
-                        tracing::error!("diaryDumpMessages failed: {e}");
-                    }
+                    self.diary_dump_messages().await;
                 }
                 return Ok(());
             }
+        }
+    }
+
+    /// kuni's `Worker::diaryDumpMessages`: clears this worker's adopted pins, then
+    /// dumps the context to the diary.
+    async fn diary_dump_messages(&self) {
+        self.pins.lock().unwrap().clear();
+        if let Err(e) = App::diary_dump_messages(&self.app, &self.session).await {
+            tracing::error!("diaryDumpMessages failed: {e}");
         }
     }
 
@@ -538,7 +577,7 @@ pub async fn spawn_workers(app: &Arc<App>) {
     let relevance_threshold = cfg.misc.diary_min_relatedness as f64;
     for _ in 0..count {
         let runner = app.notifications.run().await;
-        let worker = Worker::new(app.clone(), relevance_threshold);
+        let worker = Worker::new(app.clone(), relevance_threshold, runner.pins());
         app.worker_sessions.lock().unwrap().push(worker.session.clone());
         app.worker_wakeups.lock().unwrap().push(worker.wake_up.clone());
         tokio::spawn(WorkerRunner { worker, runner }.loop_forever());

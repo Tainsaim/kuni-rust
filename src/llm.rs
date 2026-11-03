@@ -41,6 +41,13 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// kuni's `IOpenAIChat::EMBEDDING_TAG`: inline image embeddings are carried as
+/// `<{TAG}>data:image/jpg;base64...</{TAG}>` inside message content (the producer
+/// ships with the vision slice). A tool-call result containing the tag marks a low
+/// quality tool call (worker rollback; Worker.cpp:303-321), and outside strings
+/// containing it are replaced with "malicious" (llmui/checkForMaliciousPayloads).
+pub const EMBEDDING_TAG: &str = "kuni_embedding";
+
 /// One entry of the LLM conversation context (kuni's `Session` element).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Message {
@@ -55,22 +62,8 @@ pub struct Message {
 }
 
 impl Message {
-    pub fn system(content: impl Into<String>) -> Self {
-        Self { role: Role::System, content: content.into(), ..Default::default() }
-    }
     pub fn user(content: impl Into<String>) -> Self {
         Self { role: Role::User, content: content.into(), ..Default::default() }
-    }
-    pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: Role::Assistant, content: content.into(), ..Default::default() }
-    }
-    pub fn assistant_with_tool_calls(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
-        Self {
-            role: Role::Assistant,
-            content: content.into(),
-            tool_calls,
-            ..Default::default()
-        }
     }
     pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self { role: Role::Tool, tool_call_id: tool_call_id.into(), content: content.into(), ..Default::default() }
@@ -548,7 +541,10 @@ mod tests {
 
     #[test]
     fn usage_estimate_fallback() {
-        let messages = vec![Message::user("some user text"), Message::assistant("reply!")];
+        let messages = vec![
+            Message::user("some user text"),
+            Message { role: Role::Assistant, content: "reply!".into(), ..Default::default() },
+        ];
         let (empty, usage) = Deltas {
             content: "generated line".into(),
             ..Default::default()
@@ -562,17 +558,19 @@ mod tests {
     #[test]
     fn to_api_shapes() {
         let msgs = [
-            Message::system("sys"),
+            Message { role: Role::System, content: "sys".into(), ..Default::default() },
             Message::user("q"),
             Message::tool("call_9", "result"),
-            Message::assistant_with_tool_calls(
-                "",
-                vec![ToolCall {
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCall {
                     id: "call_9".into(),
                     name: "do".into(),
                     arguments: serde_json::json!({"x": 1}),
                 }],
-            ),
+                ..Default::default()
+            },
         ];
         let jsons: Vec<Value> = msgs.iter().map(Message::to_api).collect();
         assert_eq!(jsons[2], serde_json::json!({"role": "tool", "content": "result", "tool_call_id": "call_9"}));

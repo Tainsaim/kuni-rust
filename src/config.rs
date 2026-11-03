@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use notify::Watcher as _;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::RwLock;
 
 /// kuni's `Config::SLEEP_MAX_TIME` (`std::chrono::hours(6)`): the hard cap of the
 /// sleeping diary consolidation.
@@ -352,8 +352,6 @@ chat_id = 0                   # Telegram dialog id this knowledge belongs to (0 
 pub struct ConfigHub {
     path: PathBuf,
     inner: RwLock<Config>,
-    rx: watch::Receiver<u64>,
-    generation: std::sync::atomic::AtomicU64,
 }
 
 impl ConfigHub {
@@ -373,14 +371,10 @@ impl ConfigHub {
             .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))?;
         Self::validate(&cfg)?;
 
-        let (tx, rx) = watch::channel(0u64);
         let hub = Arc::new(Self {
             path: path.to_path_buf(),
             inner: RwLock::new(cfg),
-            rx,
-            generation: std::sync::atomic::AtomicU64::new(0),
         });
-        let hub_rx = tx.clone();
 
         // Hot-reload watcher.
         let watch_path = hub.path.clone();
@@ -424,11 +418,6 @@ impl ConfigHub {
                                             continue;
                                         }
                                         *hub.inner.write().await = new;
-                                        let new_gen = hub
-                                            .generation
-                                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                                            + 1;
-                                        let _ = hub_rx.send(new_gen);
                                         tracing::info!("config.toml reloaded");
                                     }
                                     Err(e) => tracing::error!("config reload parse failed: {e}"),
@@ -462,39 +451,5 @@ impl ConfigHub {
     pub async fn get(&self) -> Config {
         self.inner.read().await.clone()
     }
-
-    /// Reference-counted read for short-lived borrows inside a single await-free scope.
-    pub async fn snapshot(&self) -> SnapshotGuard {
-        SnapshotGuard {
-            cfg: self.inner.read().await.clone(),
-        }
-    }
-
-    /// Waits until the config changed since `generation`.
-    pub async fn changed(&self, generation: u64) -> (Config, u64) {
-        let mut rx = self.rx.clone();
-        while *rx.borrow() <= generation {
-            if rx.changed().await.is_err() {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            }
-        }
-        let generation = *rx.borrow();
-        (self.inner.read().await.clone(), generation)
-    }
-
-    pub async fn generation(&self) -> u64 {
-        *self.rx.borrow()
-    }
 }
 
-pub struct SnapshotGuard {
-    cfg: Config,
-}
-
-impl std::ops::Deref for SnapshotGuard {
-    type Target = Config;
-
-    fn deref(&self) -> &Config {
-        &self.cfg
-    }
-}

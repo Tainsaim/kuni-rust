@@ -2,7 +2,6 @@
 //! and anti-repeat checks. Ports of kuni's human-imitation logic
 //! (`util/telegramPostMessage`, `send_telegram_message` tool internals).
 
-use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use rand::Rng;
@@ -274,63 +273,6 @@ pub fn split_for_sending(text: &str) -> Vec<String> {
     out
 }
 
-/// Anti-repeat store — kuni's anti-repetition for own messages using embeddings
-/// (`anti_repeat_trigger_max/avg`, +0.07 head start soak per offender).
-#[derive(Default)]
-pub struct AntiRepeat {
-    embedding_history: VecDeque<Vec<f64>>,
-    offender_head_start: f64,
-}
-
-impl AntiRepeat {
-    pub fn push(&mut self, embedding: Option<Vec<f64>>, max_history: usize) {
-        if let Some(embedding) = embedding {
-            self.embedding_history.push_front(embedding);
-            self.embedding_history.truncate(max_history);
-        }
-    }
-
-    /// Returns an error line for the LLM if the message would repeat previous ones.
-    pub fn violation(
-        &mut self,
-        embedding: Option<&[f64]>,
-        trigger_max: f64,
-        trigger_avg: f64,
-    ) -> Option<String> {
-        let embedding = embedding?;
-        if self.embedding_history.is_empty() {
-            self.offender_head_start = (self.offender_head_start - 0.07).max(0.0);
-            return None;
-        }
-        let mut sims: Vec<f64> = self
-            .embedding_history
-            .iter()
-            .map(|e| cosine_similarity(embedding, e))
-            .collect();
-        sims.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        let max = sims[0];
-        let avg_slice_len = sims.len().saturating_sub(6).max(1);
-        let avg = if sims.len() > 6 {
-            sims[6..].iter().sum::<f64>() / avg_slice_len as f64
-        } else {
-            sims.iter().sum::<f64>() / sims.len() as f64
-        };
-        let head = self.offender_head_start;
-        if max > trigger_max - head || avg > trigger_avg - head.min(0.2) {
-            self.offender_head_start = (head + 0.07).min(0.4);
-            Some(format!(
-                "Too similar to previous messages (max {max:.3} > {:.3}, avg {avg:.3}). \
-                 Don't repeat yourself. Consider calling #wait instead, or send a reaction, \
-                 or ask the diary (#ask).",
-                trigger_max - head
-            ))
-        } else {
-            self.offender_head_start = (self.offender_head_start - 0.07).max(0.0);
-            None
-        }
-    }
-}
-
 pub fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
@@ -417,18 +359,6 @@ mod tests {
         let latin = "hello world this is a test string for typos";
         let mutated = typo_until(987654321, latin, 400);
         assert_ne!(mutated, latin);
-    }
-
-    #[test]
-    fn anti_repeat_works() {
-        let mut anti = AntiRepeat::default();
-        anti.push(Some(vec![1.0, 0.0]), 32);
-        anti.push(Some(vec![1.0, 0.0]), 32);
-        let v = anti.violation(Some(&[1.0, 0.0]), 0.95, 0.85);
-        assert!(v.is_some(), "identical embedding must trigger anti-repeat");
-        let fresh = AntiRepeat::default();
-        let mut fresh = fresh;
-        assert!(fresh.violation(None, 0.95, 0.85).is_none());
     }
 
     #[test]

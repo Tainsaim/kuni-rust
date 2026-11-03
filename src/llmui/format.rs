@@ -86,7 +86,7 @@ fn html_escape(s: &str) -> String {
 
 /// Sender display name: for users first+last name, for groups/channels the title.
 fn sender_name(peer: &Peer) -> String {
-    match peer {
+    let mut name = match peer {
         Peer::User(user) => {
             let name = user.full_name();
             if name.is_empty() {
@@ -101,7 +101,9 @@ fn sender_name(peer: &Peer) -> String {
             .unwrap_or_else(|| "unnamed group".to_string()),
         Peer::Channel(channel) => channel.title().to_string(),
         _ => "unnamed".to_string(),
-    }
+    };
+    super::check_malicious_payloads(&mut name);
+    name
 }
 
 /// One chat history message as the LLM sees it, recursively prepending the replied-to
@@ -196,10 +198,11 @@ pub async fn format_history_message(
         line.push_str(&format!("<reactions count=\"{count}\" />\n"));
     }
     // Body: markdown-ish view of the text if present, else media marker.
-    let text = message.text();
+    let mut text = message.text().to_string();
+    super::check_malicious_payloads(&mut text);
     let media = message.media();
     let body = if !text.is_empty() {
-        Some(text.to_string())
+        Some(text)
     } else {
         media.as_ref().map(media_marker)
     };
@@ -229,10 +232,12 @@ fn peer_ref_id(
 
 /// Best-effort sender name by id using the runtime peer cache.
 async fn entity_name(tg: &Tg, dialog_id: i64) -> String {
-    match tg.chat(dialog_id).await {
+    let mut name = match tg.chat(dialog_id).await {
         Some(peer) => sender_name(&peer),
         None => format!("id {dialog_id}"),
-    }
+    };
+    super::check_malicious_payloads(&mut name);
+    name
 }
 
 fn xml_attr(value: String) -> String {
