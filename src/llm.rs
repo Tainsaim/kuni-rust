@@ -781,7 +781,7 @@ mod tests {
             "hey <{t}>data:image/jpg;base64,QUJD</{t}> tail",
             t = EMBEDDING_TAG
         );
-        let out = to_api_expanded(&[Message::user(content)]);
+        let out = Message::to_api_expanded(&[Message::user(content)]);
         assert_eq!(
             serde_json::Value::Array(out),
             serde_json::json!([
@@ -793,12 +793,12 @@ mod tests {
             ])
         );
         // Messages without the tag keep the plain shape.
-        let plain = to_api_expanded(&[Message::user("hi")]);
+        let plain = Message::to_api_expanded(&[Message::user("hi")]);
         assert_eq!(plain, vec![Message::user("hi").to_api()]);
         // Malformed (unclosed) tag keeps the remaining content verbatim: one closed
         // pair first, then an opening tag without a closing one.
         let bad_src = format!("ok <{t}>A</{t}> tail <{t}>oops", t = EMBEDDING_TAG);
-        let bad = to_api_expanded(&[Message::user(bad_src.clone())]);
+        let bad = Message::to_api_expanded(&[Message::user(bad_src.clone())]);
         assert_eq!(
             bad,
             vec![
