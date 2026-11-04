@@ -665,6 +665,25 @@ pub async fn open_telegram_chat(app: &Arc<App>, ctx: &Ctx, chat_id: i64) -> Resu
         result = format!("You switched to the chat \"{title}\" in Telegram.\n{result}");
     }
 
+    // kuni-rs-specific flood knowledge (no kuni-base counterpart): when the opened
+    // chat is the configured flood chat (or `chat_id = 0` matches any), surface the
+    // glossary and rules verbatim. Files are read live from the working directory,
+    // so edits hot-reload the same way prompts/ do. Any miss (module disabled,
+    // other chat, missing or empty file) silently keeps the module off.
+    if cfg.flood.enabled && (cfg.flood.chat_id == 0 || cfg.flood.chat_id == chat_id) {
+        for (path, tag) in [
+            (&cfg.flood.context_file, "flood_context"),
+            (&cfg.flood.rules_file, "flood_rules"),
+        ] {
+            if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                let content = content.trim();
+                if !content.is_empty() {
+                    result += &format!("\n<{tag}>\n{content}\n</{tag}>");
+                }
+            }
+        }
+    }
+
     let opened = Arc::new(OpenedChat {
         chat_id,
         title: title.clone(),

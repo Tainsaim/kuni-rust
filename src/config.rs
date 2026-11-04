@@ -231,9 +231,16 @@ impl Default for WebSearch {
 }
 
 /// Flood-specific knowledge files of this instance (one flood chat).
+///
+/// kuni-rs-specific module (no kuni-base counterpart): when the character opens
+/// the configured flood chat (or any chat when `chat_id = 0`), the glossary and
+/// rules files are injected into the context verbatim. Everything is opt-in:
+/// `enabled = false` keeps the module fully off, identical to pre-module behavior.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Flood {
+    /// Master switch; `false` disables the whole module.
+    pub enabled: bool,
     /// Generalized flood context (glossary), e.g. english.md.
     pub context_file: String,
     /// Rules of the specific flood, e.g. rules.md.
@@ -246,6 +253,7 @@ pub struct Flood {
 impl Default for Flood {
     fn default() -> Self {
         Self {
+            enabled: false,
             context_file: "english.md".into(),
             rules_file: "rules.md".into(),
             chat_id: 0,
@@ -343,6 +351,10 @@ ollama_bearer_key = ""
 # llm_audio_to_text = { model = "base", endpoint = { base_url = "http://localhost:9000/v1/", bearer_key = "" } }
 
 [flood]
+# kuni-rs-specific: flood (roleplay chat) knowledge injected into the context when
+# the flooding chat is opened. Files are paths relative to the working directory
+# and are re-read on every open, so edits hot-reload. Disabled by default.
+enabled = false
 context_file = "english.md"   # generalized flood context/glossary
 rules_file = "rules.md"       # rules of the specific flood
 chat_id = 0                   # Telegram dialog id this knowledge belongs to (0 = any)
